@@ -1,0 +1,74 @@
+{
+  "project": "demo-app",
+  "version": "1.4.2",
+  "artifacts": [
+    {
+      "path": "dist/api-1.4.2-py3-none-any.whl",
+      "dependencies": [
+        {
+          "name": "flask",
+          "purl": "pkg:pypi/Flask",
+          "version": "2.3.3",
+          "type": "direct"
+        },
+        {
+          "name": "Jinja2",
+          "version": "3.1.2",
+          "type": "direct"
+        },
+        {
+          "name": "typing-extensions",
+          "version": "4.8.0",
+          "type": "direct"
+        },
+        {
+          "name": "urllib3",
+          "version": "2.0.7",
+          "type": "indirect",
+          "dependency_chain": ["requests"]
+        },
+        {
+          "name": "certifi",
+          "version": "2024.2.2",
+          "type": "indirect",
+          "dependency_chain": ["requests"]
+        },
+        {
+          "name": "charset-normalizer",
+          "version": "3.3.2",
+          "type": "indirect",
+          "dependency_chain": ["requests"]
+        },
+        {
+          "name": "left-pad",
+          "ecosystem": "pypi",
+          "version": "0.1.0",
+          "type": "direct"
+        }
+      ]
+    },
+    {
+      "path": "dist/worker-1.4.2-py3-none-any.whl",
+      "dependencies": [
+        {
+          "name": "urllib3",
+          "version": "1.26.18",
+          "type": "indirect",
+          "dependency_chain": ["botocore"]
+        },
+        {
+          "name": "certifi",
+          "version": "2024.2.2",
+          "type": "indirect",
+          "dependency_chain": ["botocore"]
+        },
+        {
+          "name": "left-pad",
+          "purl": "pkg:npm/left-pad",
+          "version": "1.3.0",
+          "type": "direct"
+        }
+      ]
+    }
+  ]
+}

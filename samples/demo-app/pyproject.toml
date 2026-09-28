@@ -1,0 +1,7 @@
+[project]
+name = "demo-app"
+version = "1.4.2"
+dependencies = [
+  "Flask==2.3.3",
+  "requests==2.31.0",
+]

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-sca"
+version = "0.1.0"
+description = "Offline dependency evidence merging for Python software composition analysis"
+requires-python = ">=3.11"
+
+[project.scripts]
+offline-sca = "sca.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sca*"]
