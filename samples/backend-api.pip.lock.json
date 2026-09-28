@@ -1,0 +1,30 @@
+{
+  "project": "shopstack",
+  "version": "2.0.0",
+  "packages": {
+    "requests": {
+      "name": "requests",
+      "version": "2.32.3",
+      "dependency_type": "direct",
+      "scope": "runtime",
+      "location_path": "artifacts/backend-api/requirements.lock",
+      "integrity": "sha256:api-requests"
+    },
+    "urllib3": {
+      "name": "urllib3",
+      "version": "2.2.1",
+      "dependency_type": "transitive",
+      "requested_by": "requests",
+      "scope": "runtime",
+      "location_path": "artifacts/backend-api/python-packages/urllib3-2.2.1.dist-info"
+    },
+    "PyYAML": {
+      "name": "PyYAML",
+      "version": "6.0.2",
+      "dependency_type": "direct",
+      "scope": "runtime",
+      "location_path": "artifacts/backend-api/requirements.lock#PyYAML"
+    }
+  }
+}
+

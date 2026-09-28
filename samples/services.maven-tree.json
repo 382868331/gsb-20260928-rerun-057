@@ -1,0 +1,30 @@
+{
+  "project": "shopstack",
+  "version": "2.0.0",
+  "dependencies": [
+    {
+      "group_id": "com.example",
+      "artifact_id": "platform-core",
+      "version": "9.1.0",
+      "dependency_type": "direct",
+      "location_path": "service-account/build.gradle#implementation",
+      "aliases": ["maven:com.example.legacy:platform-core"]
+    },
+    {
+      "group_id": "com.example.legacy",
+      "artifact_id": "platform-core",
+      "version": "9.1.0",
+      "dependency_type": "transitive",
+      "requested_by": "com.example:legacy-bridge",
+      "location_path": "legacy-bridge/pom.xml#com.example.legacy:platform-core"
+    },
+    {
+      "group_id": "org.apache.commons",
+      "artifact_id": "commons-lang3",
+      "version": "3.17.0",
+      "dependency_type": "direct",
+      "location_path": "service-order/build.gradle#implementation"
+    }
+  ]
+}
+
