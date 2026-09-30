@@ -47,6 +47,32 @@ CREATE TABLE IF NOT EXISTS component_aliases (
     PRIMARY KEY(source_component_id, alias_component_id)
 );
 
+CREATE TABLE IF NOT EXISTS manual_aliases (
+    id INTEGER PRIMARY KEY,
+    ecosystem TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    target_canonical_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'revoked')) DEFAULT 'pending',
+    note TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS component_merge_map (
+    alias_id INTEGER NOT NULL REFERENCES manual_aliases(id),
+    source_component_id INTEGER NOT NULL REFERENCES components(id),
+    target_component_id INTEGER NOT NULL REFERENCES components(id),
+    PRIMARY KEY(alias_id, source_component_id, target_component_id)
+);
+
+CREATE TABLE IF NOT EXISTS alias_events (
+    id INTEGER PRIMARY KEY,
+    alias_id INTEGER NOT NULL REFERENCES manual_aliases(id),
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dependency_evidence (
     id INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -247,39 +273,236 @@ class Store:
         return merged
 
     def refresh_project_components(self, project_id: int | None = None) -> None:
-        where = "WHERE e.project_id=?" if project_id is not None else ""
-        params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
         if project_id is not None:
             self.conn.execute("DELETE FROM project_components WHERE project_id=?", (project_id,))
+            rows = self.conn.execute(
+                "SELECT project_id, component_id, version FROM dependency_evidence WHERE project_id=?",
+                (project_id,),
+            ).fetchall()
         else:
             self.conn.execute("DELETE FROM project_components")
-        rows = self.conn.execute(
-            f"""
-            SELECT e.project_id, e.component_id,
-                   json_group_array(DISTINCT e.version) AS versions,
-                   COUNT(*) AS evidence_count,
-                   COUNT(DISTINCT e.version) AS version_count
-            FROM dependency_evidence e
-            {where}
-            GROUP BY e.project_id, e.component_id
-            """,
-            params,
-        ).fetchall()
+            rows = self.conn.execute(
+                "SELECT project_id, component_id, version FROM dependency_evidence"
+            ).fetchall()
+        parent = self._merge_parent()
+        groups: dict[tuple[int, int], dict[str, Any]] = {}
         for row in rows:
-            versions = sorted(value for value in json.loads(row["versions"]) if value)
+            key = (int(row["project_id"]), self._resolve_component(int(row["component_id"]), parent))
+            group = groups.setdefault(key, {"versions": set(), "count": 0})
+            if row["version"]:
+                group["versions"].add(row["version"])
+            group["count"] += 1
+        for (group_project_id, component_id), group in sorted(groups.items()):
+            versions = sorted(group["versions"])
             self.conn.execute(
                 "INSERT INTO project_components(project_id, component_id, versions_json, status, evidence_count) "
                 "VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id, component_id) DO UPDATE SET "
                 "versions_json=excluded.versions_json, status=excluded.status, evidence_count=excluded.evidence_count",
                 (
-                    row["project_id"],
-                    row["component_id"],
+                    group_project_id,
+                    component_id,
                     json.dumps(versions, ensure_ascii=False),
-                    "conflict" if row["version_count"] > 1 else "unified",
-                    row["evidence_count"],
+                    "conflict" if len(versions) > 1 else "unified",
+                    group["count"],
                 ),
             )
         self.conn.commit()
+
+    def _merge_parent(self) -> dict[int, int]:
+        rows = self.conn.execute(
+            "SELECT m.source_component_id, m.target_component_id FROM component_merge_map m "
+            "JOIN manual_aliases a ON a.id = m.alias_id WHERE a.status = 'approved'"
+        ).fetchall()
+        parent: dict[int, int] = {}
+        for row in rows:
+            source_root = self._resolve_component(int(row[0]), parent)
+            target_root = self._resolve_component(int(row[1]), parent)
+            if source_root != target_root:
+                parent[source_root] = target_root
+        return parent
+
+    @staticmethod
+    def _resolve_component(component_id: int, parent: dict[int, int]) -> int:
+        parent.setdefault(component_id, component_id)
+        root = component_id
+        while parent[root] != root:
+            root = parent[root]
+        while parent[component_id] != component_id:
+            parent[component_id], component_id = root, parent[component_id]
+        return root
+
+    def _component_row(self, ecosystem: str, name: str) -> sqlite3.Row | None:
+        ecosystem_value, canonical_name = component_key(ecosystem, name)
+        return self.conn.execute(
+            "SELECT * FROM components WHERE ecosystem=? AND canonical_name=?",
+            (ecosystem_value, canonical_name),
+        ).fetchone()
+
+    def _alias_row(self, alias_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM manual_aliases WHERE id=?", (alias_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"alias not found: {alias_id}")
+        return row
+
+    def _record_alias_event(self, alias_id: int, action: str, detail: Any) -> None:
+        self.conn.execute(
+            "INSERT INTO alias_events(alias_id, action, detail, created_at) VALUES(?, ?, ?, ?)",
+            (alias_id, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), utc_now()),
+        )
+
+    def propose_alias(
+        self,
+        ecosystem: str,
+        name: str,
+        target_name: str,
+        target_ecosystem: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        ecosystem_value, canonical_name = component_key(ecosystem, name)
+        target_value, target_canonical = component_key(target_ecosystem or ecosystem, target_name)
+        if ecosystem_value != target_value:
+            raise ValueError(
+                f"manual aliases require a single ecosystem: {ecosystem_value} vs {target_value}"
+            )
+        if canonical_name == target_canonical:
+            raise ValueError(f"alias target already resolves to {canonical_name}")
+        source = self._component_row(ecosystem_value, canonical_name)
+        target = self._component_row(ecosystem_value, target_canonical)
+        if source is None:
+            raise KeyError(f"component not found: {ecosystem_value}/{canonical_name}")
+        if target is None:
+            raise KeyError(f"component not found: {ecosystem_value}/{target_canonical}")
+        existing = self.conn.execute(
+            "SELECT id, status FROM manual_aliases WHERE ecosystem=? AND status != 'revoked' AND "
+            "((canonical_name=? AND target_canonical_name=?) OR (canonical_name=? AND target_canonical_name=?))",
+            (ecosystem_value, canonical_name, target_canonical, target_canonical, canonical_name),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(f"alias already exists: id {existing['id']} ({existing['status']})")
+        cursor = self.conn.execute(
+            "INSERT INTO manual_aliases(ecosystem, canonical_name, target_canonical_name, status, note, created_at) "
+            "VALUES(?, ?, ?, 'pending', ?, ?)",
+            (ecosystem_value, canonical_name, target_canonical, note, utc_now()),
+        )
+        alias_id = int(cursor.lastrowid)
+        self._record_alias_event(
+            alias_id,
+            "proposed",
+            {
+                "ecosystem": ecosystem_value,
+                "canonical_name": canonical_name,
+                "target_canonical_name": target_canonical,
+                "note": note,
+            },
+        )
+        self.conn.commit()
+        return alias_id
+
+    def list_aliases(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM manual_aliases ORDER BY id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def preview_alias(self, alias_id: int) -> dict[str, Any]:
+        alias = self._alias_row(alias_id)
+        source = self._component_row(alias["ecosystem"], alias["canonical_name"])
+        target = self._component_row(alias["ecosystem"], alias["target_canonical_name"])
+        if source is None or target is None:
+            raise KeyError(f"alias {alias_id} references a component that no longer exists")
+        parent = self._merge_parent()
+        source_root = self._resolve_component(int(source["id"]), parent)
+        target_root = self._resolve_component(int(target["id"]), parent)
+        already_merged = source_root == target_root
+        if not already_merged:
+            parent[source_root] = target_root
+        merged_root = self._resolve_component(int(source["id"]), parent)
+        member_ids = {
+            int(row[0])
+            for row in self.conn.execute("SELECT id FROM components").fetchall()
+            if self._resolve_component(int(row[0]), parent) == merged_root
+        }
+        placeholders = ",".join("?" for _ in member_ids)
+        components = self.conn.execute(
+            f"SELECT * FROM components WHERE id IN ({placeholders}) ORDER BY id",
+            tuple(sorted(member_ids)),
+        ).fetchall()
+        evidence_rows = self.conn.execute(
+            f"""
+            SELECT e.project_id, e.component_id, e.version, p.name AS project_name, p.version AS project_version
+            FROM dependency_evidence e JOIN projects p ON p.id = e.project_id
+            WHERE e.component_id IN ({placeholders})
+            """,
+            tuple(sorted(member_ids)),
+        ).fetchall()
+        impact: dict[int, dict[str, Any]] = {}
+        for row in evidence_rows:
+            entry = impact.setdefault(
+                int(row["project_id"]),
+                {
+                    "project_id": int(row["project_id"]),
+                    "project": row["project_name"],
+                    "project_version": row["project_version"],
+                    "evidence_count": 0,
+                    "versions": set(),
+                },
+            )
+            entry["evidence_count"] += 1
+            if row["version"]:
+                entry["versions"].add(row["version"])
+        for entry in impact.values():
+            entry["versions"] = sorted(entry["versions"])
+            entry["resulting_status"] = "conflict" if len(entry["versions"]) > 1 else "unified"
+        return {
+            "alias": dict(alias),
+            "already_merged": already_merged,
+            "components": [dict(row) for row in components],
+            "impact": sorted(impact.values(), key=lambda entry: entry["project_id"]),
+        }
+
+    def approve_alias(self, alias_id: int) -> dict[str, Any]:
+        alias = self._alias_row(alias_id)
+        if alias["status"] != "pending":
+            raise ValueError(f"alias {alias_id} is {alias['status']}, only pending aliases can be approved")
+        preview = self.preview_alias(alias_id)
+        source = self._component_row(alias["ecosystem"], alias["canonical_name"])
+        target = self._component_row(alias["ecosystem"], alias["target_canonical_name"])
+        self.conn.execute(
+            "INSERT INTO component_merge_map(alias_id, source_component_id, target_component_id) VALUES(?, ?, ?)",
+            (alias_id, int(source["id"]), int(target["id"])),
+        )
+        self.conn.execute(
+            "UPDATE manual_aliases SET status='approved', decided_at=? WHERE id=?",
+            (utc_now(), alias_id),
+        )
+        self._record_alias_event(alias_id, "approved", preview)
+        self.refresh_project_components()
+        return preview
+
+    def revoke_alias(self, alias_id: int) -> dict[str, Any]:
+        alias = self._alias_row(alias_id)
+        if alias["status"] != "approved":
+            raise ValueError(f"alias {alias_id} is {alias['status']}, only approved aliases can be revoked")
+        snapshot = self.preview_alias(alias_id)
+        self.conn.execute(
+            "UPDATE manual_aliases SET status='revoked', decided_at=? WHERE id=?",
+            (utc_now(), alias_id),
+        )
+        self._record_alias_event(alias_id, "revoked", snapshot)
+        self.refresh_project_components()
+        return snapshot
+
+    def alias_history(self, alias_id: int | None = None) -> list[dict[str, Any]]:
+        if alias_id is None:
+            rows = self.conn.execute(
+                "SELECT * FROM alias_events ORDER BY id"
+            ).fetchall()
+        else:
+            self._alias_row(alias_id)
+            rows = self.conn.execute(
+                "SELECT * FROM alias_events WHERE alias_id=? ORDER BY id", (alias_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def project_report(self, project_name: str, project_version: str | None = None) -> dict[str, Any]:
         params: list[Any] = [project_name]
@@ -313,8 +536,26 @@ class Store:
             """,
             (project["id"],),
         ).fetchall()
+        parent = self._merge_parent()
+        component_rows = self.conn.execute(
+            "SELECT id, ecosystem, canonical_name, purl, display_name FROM components"
+        ).fetchall()
+        component_by_id = {int(row["id"]): row for row in component_rows}
+        evidence_items = []
+        for row in evidence:
+            item = dict(row)
+            resolved_id = self._resolve_component(int(item["component_id"]), parent)
+            item["original_component_id"] = item["component_id"]
+            item["original_canonical_name"] = item["canonical_name"]
+            item["original_purl"] = item["purl"]
+            if resolved_id != int(item["component_id"]) and resolved_id in component_by_id:
+                resolved = component_by_id[resolved_id]
+                item["component_id"] = resolved_id
+                item["canonical_name"] = resolved["canonical_name"]
+                item["purl"] = resolved["purl"]
+            evidence_items.append(item)
         return {
             "project": {"name": project["name"], "version": project["version"]},
             "components": [dict(row) for row in components],
-            "evidence": [dict(row) for row in evidence],
+            "evidence": evidence_items,
         }
