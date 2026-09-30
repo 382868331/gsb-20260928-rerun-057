@@ -41,10 +41,24 @@ CREATE TABLE IF NOT EXISTS components (
     UNIQUE(ecosystem, canonical_name)
 );
 
-CREATE TABLE IF NOT EXISTS component_aliases (
-    source_component_id INTEGER NOT NULL REFERENCES components(id),
-    alias_component_id INTEGER NOT NULL REFERENCES components(id),
-    PRIMARY KEY(source_component_id, alias_component_id)
+CREATE TABLE IF NOT EXISTS alias_edges (
+    id INTEGER PRIMARY KEY,
+    from_component_id INTEGER NOT NULL REFERENCES components(id),
+    to_component_id INTEGER NOT NULL REFERENCES components(id),
+    origin TEXT NOT NULL CHECK(origin IN ('manifest', 'manual')),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'revoked')),
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by TEXT,
+    UNIQUE(from_component_id, to_component_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_snapshots (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    taken_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    report_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS dependency_evidence (
@@ -126,8 +140,8 @@ class Store:
             source_id = int(cursor.lastrowid)
             inserted = self._insert_evidence(cursor, project_id, source_id, manifest.evidence)
         self.conn.commit()
-        self.consolidate_aliases()
         self.refresh_project_components(project_id)
+        self.snapshot_project(project_id, reason="import")
         return {
             "project_id": project_id,
             "source_id": source_id,
@@ -178,7 +192,7 @@ class Store:
                 ),
             )
             inserted += int(cursor.rowcount)
-            self._insert_alias_edges(cursor, item, component_id)
+            self._register_manifest_aliases(cursor, item, component_id)
         return inserted
 
     def _component_id(self, cursor: sqlite3.Cursor, item: DependencyEvidence) -> int:
@@ -190,7 +204,7 @@ class Store:
         )
         return int(cursor.fetchone()[0])
 
-    def _insert_alias_edges(
+    def _register_manifest_aliases(
         self, cursor: sqlite3.Cursor, item: DependencyEvidence, source_component_id: int
     ) -> None:
         for alias in item.aliases:
@@ -205,14 +219,73 @@ class Store:
             row = cursor.fetchone()
             if row is None:
                 continue
-            first, second = sorted((source_component_id, int(row[0])))
-            cursor.execute(
-                "INSERT OR IGNORE INTO component_aliases(source_component_id, alias_component_id) VALUES(?, ?)",
-                (first, second),
+            alias_component_id = int(row[0])
+            if self._component_row(cursor, source_component_id)["ecosystem"] != ecosystem:
+                continue
+            self._upsert_alias_edge(
+                cursor, source_component_id, alias_component_id, origin="manifest", status="approved"
             )
 
-    def consolidate_aliases(self) -> int:
-        rows = self.conn.execute("SELECT source_component_id, alias_component_id FROM component_aliases").fetchall()
+    @staticmethod
+    def _component_row(cursor: sqlite3.Cursor, component_id: int) -> sqlite3.Row:
+        row = cursor.execute(
+            "SELECT id, ecosystem, canonical_name, purl, display_name FROM components WHERE id=?",
+            (component_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"component not found: {component_id}")
+        return row
+
+    def resolve_component(self, ref: str) -> sqlite3.Row:
+        if ":" not in ref:
+            raise ValueError(f"component reference must use ecosystem:name form: {ref}")
+        ecosystem, remainder = ref.split(":", 1)
+        ecosystem_value, canonical_name = component_key(ecosystem, remainder)
+        row = self.conn.execute(
+            "SELECT id, ecosystem, canonical_name, purl, display_name FROM components "
+            "WHERE ecosystem=? AND canonical_name=?",
+            (ecosystem_value, canonical_name),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"component not found: {ref}")
+        return row
+
+    @staticmethod
+    def _ordered(left: int, right: int) -> tuple[int, int]:
+        return (left, right) if left < right else (right, left)
+
+    def _upsert_alias_edge(
+        self,
+        cursor: sqlite3.Cursor,
+        first_component_id: int,
+        second_component_id: int,
+        *,
+        origin: str,
+        status: str | None = None,
+    ) -> int | None:
+        if first_component_id == second_component_id:
+            return None
+        from_id, to_id = self._ordered(first_component_id, second_component_id)
+        now = utc_now()
+        cursor.execute(
+            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by) "
+            "VALUES(?, ?, ?, ?, ?, NULL, NULL) "
+            "ON CONFLICT(from_component_id, to_component_id) DO UPDATE SET "
+            "origin=CASE WHEN alias_edges.origin='manual' THEN 'manual' ELSE excluded.origin END, "
+            "status=CASE WHEN ?='manifest' AND alias_edges.origin='manifest' AND alias_edges.status='revoked' "
+            "THEN 'approved' ELSE alias_edges.status END "
+            "RETURNING id",
+            (from_id, to_id, origin, status or "pending", now, origin),
+        )
+        return int(cursor.fetchone()[0])
+
+    def _approved_edges(self, cursor: sqlite3.Cursor) -> list[tuple[int, int]]:
+        rows = cursor.execute(
+            "SELECT from_component_id, to_component_id FROM alias_edges WHERE status='approved'"
+        ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
+    def alias_groups(self) -> dict[int, int]:
         parent: dict[int, int] = {}
 
         def find(value: int) -> int:
@@ -227,26 +300,138 @@ class Store:
             if left_root != right_root:
                 parent[max(left_root, right_root)] = min(left_root, right_root)
 
-        for row in rows:
-            union(int(row[0]), int(row[1]))
-        merged = 0
-        for old_id in sorted(parent):
-            new_id = find(old_id)
-            if new_id == old_id:
-                continue
-            self.conn.execute("UPDATE dependency_evidence SET component_id=? WHERE component_id=?", (new_id, old_id))
-            self.conn.execute(
-                "UPDATE OR IGNORE project_components SET component_id=? WHERE component_id=?",
-                (new_id, old_id),
+        for left, right in self._approved_edges(self.conn.cursor()):
+            union(left, right)
+        groups = {component_id: find(component_id) for component_id in parent}
+        return groups
+
+    def alias_preview(self, first_ref: str, second_ref: str) -> dict[str, Any]:
+        first = self.resolve_component(first_ref)
+        second = self.resolve_component(second_ref)
+        first_id, second_id = int(first["id"]), int(second["id"])
+        allowed = True
+        reasons: list[str] = []
+        if first_id == second_id:
+            allowed = False
+            reasons.append("references resolve to the same component")
+        if first["ecosystem"] != second["ecosystem"]:
+            allowed = False
+            reasons.append("components belong to different ecosystems")
+        groups = self.alias_groups()
+        root = groups.get(first_id, first_id)
+        group_ids = {component_id for component_id, group_root in groups.items() if group_root == root} | {first_id}
+        group_ids.add(second_id)
+        placeholders = ",".join("?" for _ in group_ids)
+        version_rows = self.conn.execute(
+            f"SELECT project_id, COUNT(DISTINCT version) AS version_count, "
+            f"json_group_array(DISTINCT version) AS versions "
+            f"FROM dependency_evidence WHERE component_id IN ({placeholders}) GROUP BY project_id",
+            tuple(group_ids),
+        ).fetchall()
+        affected_projects = []
+        for row in version_rows:
+            versions = sorted(value for value in json.loads(row["versions"]) if value)
+            would_conflict = int(row["version_count"]) > 1
+            if would_conflict:
+                reasons.append(
+                    f"project {row['project_id']} would retain a version conflict: {', '.join(versions)}"
+                )
+            affected_projects.append(
+                {"project_id": int(row["project_id"]), "versions": versions, "would_conflict": would_conflict}
             )
-            self.conn.execute("DELETE FROM project_components WHERE component_id=?", (old_id,))
-            self.conn.execute("DELETE FROM component_aliases WHERE source_component_id=? OR alias_component_id=?", (old_id, old_id))
-            self.conn.execute("DELETE FROM components WHERE id=?", (old_id,))
-            merged += 1
+        existing = self.conn.execute(
+            "SELECT origin, status FROM alias_edges WHERE from_component_id=? AND to_component_id=?",
+            self._ordered(first_id, second_id),
+        ).fetchone()
+        cursor = self.conn.cursor()
+        members = [dict(self._component_row(cursor, component_id)) for component_id in sorted(group_ids)]
+        return {
+            "allowed": allowed,
+            "reasons": reasons,
+            "from": dict(first),
+            "to": dict(second),
+            "group_members": members,
+            "affected_projects": affected_projects,
+            "existing_edge": dict(existing) if existing else None,
+        }
+
+    def approve_alias(self, first_ref: str, second_ref: str, *, decided_by: str = "operator") -> dict[str, Any]:
+        preview = self.alias_preview(first_ref, second_ref)
+        if not preview["allowed"]:
+            raise ValueError("; ".join(preview["reasons"]))
+        first_id, second_id = int(preview["from"]["id"]), int(preview["to"]["id"])
+        from_id, to_id = self._ordered(first_id, second_id)
+        now = utc_now()
+        self.conn.execute(
+            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by) "
+            "VALUES(?, ?, 'manual', 'approved', ?, ?, ?) "
+            "ON CONFLICT(from_component_id, to_component_id) DO UPDATE SET "
+            "status='approved', decided_at=excluded.decided_at, decided_by=excluded.decided_by",
+            (from_id, to_id, now, now, decided_by),
+        )
         self.conn.commit()
-        return merged
+        affected = self._refresh_affected_projects({first_id, second_id})
+        return {"preview": preview, "refreshed_projects": affected}
+
+    def propose_alias(self, first_ref: str, second_ref: str, *, created_by: str = "operator") -> dict[str, Any]:
+        preview = self.alias_preview(first_ref, second_ref)
+        if not preview["allowed"]:
+            raise ValueError("; ".join(preview["reasons"]))
+        first_id, second_id = int(preview["from"]["id"]), int(preview["to"]["id"])
+        from_id, to_id = self._ordered(first_id, second_id)
+        now = utc_now()
+        row = self.conn.execute(
+            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by) "
+            "VALUES(?, ?, 'manual', 'pending', ?, NULL, ?) "
+            "ON CONFLICT(from_component_id, to_component_id) DO UPDATE SET "
+            "origin='manual', status=CASE WHEN alias_edges.status='revoked' THEN 'pending' ELSE alias_edges.status END, "
+            "decided_by=CASE WHEN alias_edges.status='revoked' THEN excluded.decided_by ELSE alias_edges.decided_by END "
+            "RETURNING id, status",
+            (from_id, to_id, now, created_by),
+        ).fetchone()
+        self.conn.commit()
+        return {"edge_id": int(row[0]), "status": row[1], "preview": preview}
+
+    def revoke_alias(self, first_ref: str, second_ref: str, *, decided_by: str = "operator") -> dict[str, Any]:
+        first = self.resolve_component(first_ref)
+        second = self.resolve_component(second_ref)
+        from_id, to_id = self._ordered(int(first["id"]), int(second["id"]))
+        row = self.conn.execute(
+            "SELECT id, status FROM alias_edges WHERE from_component_id=? AND to_component_id=?",
+            (from_id, to_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"alias edge not found: {first_ref} <-> {second_ref}")
+        affected_components = self._edge_component_group(from_id) | self._edge_component_group(to_id)
+        self.conn.execute(
+            "UPDATE alias_edges SET status='revoked', decided_at=?, decided_by=? WHERE id=?",
+            (utc_now(), decided_by, int(row["id"])),
+        )
+        self.conn.commit()
+        affected = self._refresh_affected_projects(affected_components, reason="alias-revoke")
+        return {"revoked_edge": int(row["id"]), "refreshed_projects": affected}
+
+    def _edge_component_group(self, component_id: int) -> set[int]:
+        groups = self.alias_groups()
+        root = groups.get(component_id, component_id)
+        return {item for item, group_root in groups.items() if group_root == root} | {root, component_id}
+
+    def _refresh_affected_projects(self, component_ids: set[int], *, reason: str = "alias-approve") -> list[int]:
+        if not component_ids:
+            return []
+        placeholders = ",".join("?" for _ in component_ids)
+        rows = self.conn.execute(
+            f"SELECT DISTINCT project_id FROM dependency_evidence WHERE component_id IN ({placeholders})",
+            tuple(component_ids),
+        ).fetchall()
+        project_ids = [int(row[0]) for row in rows]
+        for project_id in project_ids:
+            self.refresh_project_components(project_id)
+            self.snapshot_project(project_id, reason=reason)
+        return project_ids
 
     def refresh_project_components(self, project_id: int | None = None) -> None:
+        groups = self.alias_groups()
         where = "WHERE e.project_id=?" if project_id is not None else ""
         params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
         if project_id is not None:
@@ -255,28 +440,35 @@ class Store:
             self.conn.execute("DELETE FROM project_components")
         rows = self.conn.execute(
             f"""
-            SELECT e.project_id, e.component_id,
-                   json_group_array(DISTINCT e.version) AS versions,
-                   COUNT(*) AS evidence_count,
-                   COUNT(DISTINCT e.version) AS version_count
+            SELECT e.project_id, e.component_id, e.version
             FROM dependency_evidence e
             {where}
-            GROUP BY e.project_id, e.component_id
             """,
             params,
         ).fetchall()
+        aggregated: dict[tuple[int, int], dict[str, Any]] = {}
         for row in rows:
-            versions = sorted(value for value in json.loads(row["versions"]) if value)
+            raw_component_id = int(row["component_id"])
+            root_id = groups.get(raw_component_id, raw_component_id)
+            bucket = aggregated.setdefault(
+                (int(row["project_id"]), root_id),
+                {"versions": set(), "evidence_count": 0},
+            )
+            if row["version"]:
+                bucket["versions"].add(row["version"])
+            bucket["evidence_count"] += 1
+        for ((project_value, root_id), bucket) in aggregated.items():
+            versions = sorted(bucket["versions"])
             self.conn.execute(
                 "INSERT INTO project_components(project_id, component_id, versions_json, status, evidence_count) "
                 "VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id, component_id) DO UPDATE SET "
                 "versions_json=excluded.versions_json, status=excluded.status, evidence_count=excluded.evidence_count",
                 (
-                    row["project_id"],
-                    row["component_id"],
+                    project_value,
+                    root_id,
                     json.dumps(versions, ensure_ascii=False),
-                    "conflict" if row["version_count"] > 1 else "unified",
-                    row["evidence_count"],
+                    "conflict" if len(versions) > 1 else "unified",
+                    bucket["evidence_count"],
                 ),
             )
         self.conn.commit()
@@ -293,6 +485,12 @@ class Store:
         ).fetchone()
         if project is None:
             raise KeyError(f"project not found: {project_name}")
+        groups = self.alias_groups()
+        component_rows = self.conn.execute("SELECT * FROM components").fetchall()
+        members: dict[int, list[dict[str, Any]]] = {}
+        for row in component_rows:
+            root_id = groups.get(int(row["id"]), int(row["id"]))
+            members.setdefault(root_id, []).append(dict(row))
         components = self.conn.execute(
             """
             SELECT pc.*, c.ecosystem, c.canonical_name, c.purl, c.display_name
@@ -302,6 +500,11 @@ class Store:
             """,
             (project["id"],),
         ).fetchall()
+        result_components = []
+        for row in components:
+            item = dict(row)
+            item["member_components"] = sorted(members.get(int(row["component_id"]), []), key=lambda m: m["canonical_name"])
+            result_components.append(item)
         evidence = self.conn.execute(
             """
             SELECT e.*, c.ecosystem, c.canonical_name, c.purl, s.source_path, s.manifest_type
@@ -313,8 +516,79 @@ class Store:
             """,
             (project["id"],),
         ).fetchall()
+        result_evidence = []
+        for row in evidence:
+            item = dict(row)
+            raw_component_id = int(item["component_id"])
+            root_id = groups.get(raw_component_id, raw_component_id)
+            root = self.conn.execute(
+                "SELECT id, ecosystem, canonical_name, purl, display_name FROM components WHERE id=?",
+                (root_id,),
+            ).fetchone()
+            item["logical_component_id"] = root_id
+            item["logical_purl"] = root["purl"]
+            item["logical_canonical_name"] = root["canonical_name"]
+            result_evidence.append(item)
         return {
             "project": {"name": project["name"], "version": project["version"]},
-            "components": [dict(row) for row in components],
-            "evidence": [dict(row) for row in evidence],
+            "components": result_components,
+            "evidence": result_evidence,
         }
+
+    def snapshot_project(self, project_id: int, *, reason: str) -> int | None:
+        project = self.conn.execute(
+            "SELECT name, version FROM projects WHERE id=?", (project_id,)
+        ).fetchone()
+        if project is None:
+            return None
+        report = self.project_report(project["name"], project["version"])
+        now = utc_now()
+        cursor = self.conn.execute(
+            "INSERT INTO project_snapshots(project_id, taken_at, reason, report_json) VALUES(?, ?, ?, ?)",
+            (project_id, now, reason, json.dumps(report, ensure_ascii=False, sort_keys=True)),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def project_history(self, project_name: str, project_version: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = [project_name]
+        version_sql = ""
+        if project_version is not None:
+            version_sql = " AND p.version=?"
+            params.append(project_version)
+        rows = self.conn.execute(
+            f"""
+            SELECT s.id, s.project_id, s.taken_at, s.reason, s.report_json, p.name, p.version
+            FROM project_snapshots s JOIN projects p ON p.id=s.project_id
+            WHERE p.name=?{version_sql}
+            ORDER BY s.id
+            """,
+            params,
+        ).fetchall()
+        history = []
+        for row in rows:
+            history.append(
+                {
+                    "snapshot_id": int(row["id"]),
+                    "taken_at": row["taken_at"],
+                    "reason": row["reason"],
+                    "project": {"name": row["name"], "version": row["version"]},
+                    "report": json.loads(row["report_json"]),
+                }
+            )
+        return history
+
+    def pending_aliases(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.id, e.origin, e.status, e.created_at,
+                   c1.ecosystem AS from_ecosystem, c1.canonical_name AS from_name,
+                   c2.ecosystem AS to_ecosystem, c2.canonical_name AS to_name
+            FROM alias_edges e
+            JOIN components c1 ON c1.id=e.from_component_id
+            JOIN components c2 ON c2.id=e.to_component_id
+            WHERE e.status='pending'
+            ORDER BY e.id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]

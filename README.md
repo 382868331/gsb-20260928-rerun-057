@@ -6,10 +6,12 @@
 
 - 组件身份由生态系统和规范名称组成，并生成不带版本的 Package URL。
 - 只比较显示名称不会合并：`pypi/requests` 与 `npm/requests` 是两个组件。
-- Python 名称按 PEP 503 归一化，因此 `PyYAML`、`Py.YAML` 和 `pyyaml` 指向同一组件。
-- 清单显式给出的同生态别名会合并身份，例如 Maven group 迁移后的旧坐标。
+- Python 名称按 PEP 503 归一化：连续的 `-`、`_`、`.` 都会变成单个 `-`。因此 `PyYAML` 与 `pyyaml` 指向同一组件，而 `Py.YAML` 归一化为 `py-yaml`，是另一个组件；名称相近不构成合并理由。
+- 清单显式给出的同生态别名会自动按同一逻辑组件分组（例如 Maven group 迁移后的旧坐标），但随时可以人工撤回；人工新增别名时应先做影响预览再批准。跨生态或身份不存在的别名会被拒绝。
 - 版本冲突在项目内标记为 `conflict`；版本一致的多条证据标记为 `unified`。
 - 每条证据保留来源清单、原始 JSON、依赖类型、请求者、scope 和构建产物路径。
+- 人工别名支持影响预览、批准与撤回。批准只改变逻辑分组，不删除组件和证据；撤回后原始组件关系与全部出现证据恢复。别名带来的版本冲突仍标记为 `conflict`，不会因为名称相近而消失。
+- 每次导入或别名变更都会保存项目扫描结论快照，撤回别名后仍可查看历史扫描结论。
 
 ## 演示场景
 
@@ -21,6 +23,7 @@
 - npm `lodash` 在两个嵌套路径中版本一致，明确展示“合并身份但不合并证据路径”。
 - Maven `com.example:platform-core` 与旧坐标 `com.example.legacy:platform-core` 通过别名合并。
 - PyPI 与 npm 都有显示名 `requests`，但不会跨生态合并。
+- PyPI `PyYAML`（归一化 `pyyaml`）与遗留包 `Py.YAML`（归一化 `py-yaml`）仅名称相近，保持为两个组件，不会误合并。
 
 ## 使用
 
@@ -28,13 +31,23 @@
 python -m sca.cli import --db /tmp/sca.sqlite3 samples/*.json
 python -m sca.cli report --db /tmp/sca.sqlite3 --project shopstack
 python -m sca.cli report --db /tmp/sca.sqlite3 --project shopstack --json
+# 预览人工别名的影响（不写库）
+python -m sca.cli alias preview --db /tmp/sca.sqlite3 \
+  --from maven:com.example:platform-core --to maven:com.example.legacy:platform-core
+# 或先提议为待批准，再批准
+python -m sca.cli alias propose --db /tmp/sca.sqlite3 \
+  --from maven:com.example:platform-core --to maven:com.example.legacy:platform-core
+# 批准人工别名（撤回使用 alias revoke）
+python -m sca.cli alias approve --db /tmp/sca.sqlite3 \
+  --from maven:com.example:platform-core --to maven:com.example.legacy:platform-core
+# 查看历史扫描结论
+python -m sca.cli history --db /tmp/sca.sqlite3 --project shopstack
 ```
 
-重复导入同一内容不会新增证据：来源内容使用 SHA-256 去重，单条记录还有独立的规范化哈希。导入同一路径的更新内容时，会作为项目的新来源版本保留；导入不同路径但内容完全相同的副本不会产生重复证据。
+重复导入同一内容不会新增证据：来源内容使用 SHA-256 去重，单条记录还有独立的规范化哈希（包含生态、规范身份、版本与构建路径）。导入同一路径的更新内容时，会作为项目的新来源版本保留；导入不同路径但内容完全相同的副本、以及同一路径的重复导入都不会产生重复证据。组件去重通过规范身份在全库范围内追溯，跨构建路径出现的同一组件只归并身份、不合并证据。
 
 ## 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-

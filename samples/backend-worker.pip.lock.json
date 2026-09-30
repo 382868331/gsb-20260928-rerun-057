@@ -24,7 +24,14 @@
       "requested_by": "deployment-tool",
       "scope": "runtime",
       "location_path": "artifacts/worker-bundle/python/pyyaml"
+    },
+    "Py.YAML": {
+      "name": "Py.YAML",
+      "version": "1.3.0",
+      "dependency_type": "transitive",
+      "requested_by": "legacy-config-loader",
+      "scope": "runtime",
+      "location_path": "artifacts/worker-bundle/legacy-vendor/Py.YAML"
     }
   }
 }
-

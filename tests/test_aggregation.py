@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sca.cli import import_files
 from sca.identity import component_key, identify
-from sca.models import DependencyEvidence, DependencyType
+from sca.models import DependencyEvidence, DependencyType, ParsedManifest
 from sca.storage import Store
 
 
@@ -48,6 +48,10 @@ class ManifestAggregationTests(unittest.TestCase):
         self.assertEqual(by_purl["pkg:maven/com.example/platform-core"]["evidence_count"], 2)
         self.assertIn("pkg:pypi/requests", by_purl)
         self.assertIn("pkg:npm/requests", by_purl)
+        self.assertIn("pkg:pypi/pyyaml", by_purl)
+        self.assertIn("pkg:pypi/py-yaml", by_purl)
+        self.assertEqual(by_purl["pkg:pypi/pyyaml"]["evidence_count"], 2)
+        self.assertEqual(by_purl["pkg:pypi/py-yaml"]["evidence_count"], 1)
 
         debug_paths = {
             item["location_path"]
@@ -71,7 +75,7 @@ class ManifestAggregationTests(unittest.TestCase):
             db = Path(directory) / "sca.sqlite3"
             first = import_files(db, files)
             second = import_files(db, files)
-        self.assertEqual(sum(result["inserted_records"] for result in first), 14)
+        self.assertEqual(sum(result["inserted_records"] for result in first), 15)
         self.assertEqual(sum(result["inserted_records"] for result in second), 0)
 
     def test_same_version_from_distinct_build_paths_keeps_evidence(self) -> None:
@@ -106,6 +110,161 @@ class ManifestAggregationTests(unittest.TestCase):
             inserted = store._insert_evidence(cursor, project_id, source_id, evidence)
             store.conn.commit()
             self.assertEqual(inserted, 2)
+
+
+class AliasWorkflowTests(unittest.TestCase):
+    def _store_with_project(self, name: str = "demo") -> Store:
+        store = Store()
+        store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES(?, '1', 'now')", (name,)
+        )
+        return store
+
+    def _evidence(self, ecosystem: str, name: str, version: str, location: str, aliases: tuple = ()) -> DependencyEvidence:
+        return DependencyEvidence(
+            ecosystem=ecosystem,
+            name=name,
+            version=version,
+            dependency_type=DependencyType.DIRECT,
+            location_path=location,
+            aliases=aliases,
+            raw={"name": name, "version": version, "location": location},
+        )
+
+    def _add_source(self, store: Store, content_hash: str, evidence: tuple) -> int:
+        project_id = store.conn.execute("SELECT id FROM projects").fetchone()[0]
+        source_id = store.conn.execute(
+            "INSERT INTO manifest_sources(project_id, source_path, manifest_type, content_hash, imported_at) "
+            "VALUES(?, ?, 'test', ?, 'now') RETURNING id",
+            (project_id, content_hash, content_hash),
+        ).fetchone()[0]
+        cursor = store.conn.cursor()
+        store._insert_evidence(cursor, project_id, source_id, evidence)
+        store.conn.commit()
+        store.refresh_project_components(project_id)
+        return project_id
+
+    def test_cross_ecosystem_alias_is_rejected(self) -> None:
+        store = self._store_with_project()
+        self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("pypi", "requests", "2.0", "build/py-requests"),
+                self._evidence("npm", "requests", "2.0", "build/npm-requests"),
+            ),
+        )
+        preview = store.alias_preview("pypi:requests", "npm:requests")
+        self.assertFalse(preview["allowed"])
+        self.assertTrue(any("different ecosystems" in reason for reason in preview["reasons"]))
+        with self.assertRaises(ValueError):
+            store.approve_alias("pypi:requests", "npm:requests")
+        report = store.project_report("demo")
+        purls = {component["purl"] for component in report["components"]}
+        self.assertEqual(purls, {"pkg:pypi/requests", "pkg:npm/requests"})
+
+    def test_version_conflict_survives_alias_and_revoke_restores_evidence(self) -> None:
+        store = self._store_with_project()
+        project_id = self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("maven", "com.example:new-core", "1.0.0", "build-a/core"),
+                self._evidence("maven", "com.example:old-core", "2.0.0", "build-b/core"),
+            ),
+        )
+        preview = store.alias_preview("maven:com.example:new-core", "maven:com.example:old-core")
+        self.assertTrue(preview["allowed"])
+        self.assertTrue(preview["affected_projects"][0]["would_conflict"])
+        result = store.approve_alias("maven:com.example:new-core", "maven:com.example:old-core")
+        self.assertEqual(result["refreshed_projects"], [project_id])
+        report = store.project_report("demo")
+        self.assertEqual(len(report["components"]), 1)
+        merged = report["components"][0]
+        self.assertEqual(merged["status"], "conflict")
+        self.assertEqual(merged["evidence_count"], 2)
+        self.assertEqual(
+            {member["canonical_name"] for member in merged["member_components"]},
+            {"com.example:new-core", "com.example:old-core"},
+        )
+        locations = {item["location_path"] for item in report["evidence"]}
+        self.assertEqual(locations, {"build-a/core", "build-b/core"})
+
+        history_before_revoke = store.project_history("demo")
+        self.assertTrue(any(entry["reason"] == "alias-approve" for entry in history_before_revoke))
+
+        store.revoke_alias("maven:com.example:new-core", "maven:com.example:old-core")
+        report_after = store.project_report("demo")
+        self.assertEqual(len(report_after["components"]), 2)
+        self.assertEqual(
+            {component["canonical_name"] for component in report_after["components"]},
+            {"com.example:new-core", "com.example:old-core"},
+        )
+        self.assertEqual({item["location_path"] for item in report_after["evidence"]}, locations)
+        edge = store.conn.execute("SELECT status FROM alias_edges").fetchone()
+        self.assertEqual(edge["status"], "revoked")
+        history = store.project_history("demo")
+        self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in history))
+        approved_snapshot = next(entry for entry in history if entry["reason"] == "alias-approve")
+        self.assertEqual(len(approved_snapshot["report"]["components"]), 1)
+        self.assertEqual(approved_snapshot["report"]["components"][0]["status"], "conflict")
+
+    def test_similar_names_remain_distinct_and_traceable_across_builds(self) -> None:
+        store = self._store_with_project()
+        self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("pypi", "PyYAML", "6.0.2", "build-a/requirements#PyYAML"),
+                self._evidence("pypi", "Py.YAML", "1.0.0", "build-a/vendor/Py.YAML"),
+                self._evidence("pypi", "pyyaml", "6.0.2", "build-b/python/pyyaml"),
+            ),
+        )
+        report = store.project_report("demo")
+        by_purl = {component["purl"]: component for component in report["components"]}
+        self.assertEqual(by_purl["pkg:pypi/pyyaml"]["evidence_count"], 2)
+        self.assertEqual(by_purl["pkg:pypi/py-yaml"]["evidence_count"], 1)
+        yaml_paths = {
+            item["location_path"]
+            for item in report["evidence"]
+            if item["logical_purl"] == "pkg:pypi/pyyaml"
+        }
+        self.assertEqual(yaml_paths, {"build-a/requirements#PyYAML", "build-b/python/pyyaml"})
+
+    def test_duplicate_import_across_paths_adds_no_evidence(self) -> None:
+        item = self._evidence("pypi", "certifi", "2024.8.30", "build-a/python/certifi")
+        manifest = ParsedManifest(
+            project="demo",
+            project_version="1",
+            source_path="build-a/manifest.json",
+            manifest_type="test",
+            evidence=(item,),
+        )
+        with Store() as store:
+            first = store.import_manifest(manifest, b"same-content")
+            second = store.import_manifest(manifest, b"same-content")
+            self.assertEqual(first["inserted_records"], 1)
+            self.assertEqual(second["inserted_records"], 0)
+            count = store.conn.execute("SELECT COUNT(*) FROM dependency_evidence").fetchone()[0]
+            self.assertEqual(count, 1)
+            sources = store.conn.execute("SELECT COUNT(*) FROM manifest_sources").fetchone()[0]
+            self.assertEqual(sources, 1)
+
+    def test_propose_then_approve_manual_alias(self) -> None:
+        store = self._store_with_project()
+        self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("maven", "com.a:lib", "1.0", "build-a/lib"),
+                self._evidence("maven", "com.b:lib", "1.0", "build-b/lib"),
+            ),
+        )
+        proposed = store.propose_alias("maven:com.a:lib", "maven:com.b:lib")
+        self.assertEqual(proposed["status"], "pending")
+        self.assertEqual(len(store.project_report("demo")["components"]), 2)
+        store.approve_alias("maven:com.a:lib", "maven:com.b:lib")
+        self.assertEqual(len(store.project_report("demo")["components"]), 1)
 
 
 if __name__ == "__main__":
