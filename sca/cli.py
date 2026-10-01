@@ -60,10 +60,32 @@ def _print_preview(preview: dict) -> None:
     first, second = preview["from"], preview["to"]
     status = "ALLOWED" if preview["allowed"] else "REJECTED"
     print(f"[{status}] {first['purl']} <-> {second['purl']}")
+    scope = preview["scope"]
+    if scope["project"]:
+        source_text = "all approved sources" if scope["match_all_sources"] else ", ".join(scope["source_paths"])
+        version_text = "all versions"
+        if scope["min_version"] or scope["max_version"]:
+            low = scope["min_version"] or "*"
+            high = scope["max_version"] or "*"
+            version_text = f"{low}..{high}"
+        print(
+            f"  scope: {scope['ecosystem']} / "
+            f"{scope['project']['name']} {scope['project']['version']} / {version_text} / {source_text}"
+        )
     for reason in preview["reasons"]:
         print(f"  - {reason}")
+    for group in preview["merged_groups"]:
+        purls = ", ".join(component["purl"] for component in group["components"])
+        print(f"  merged: {purls} versions={', '.join(group['versions'])} sources={', '.join(group['source_paths'])}")
     for member in preview["group_members"]:
         print(f"  member: {member['purl']} ({member['display_name']})")
+    for disagreement in preview["version_disagreements"]:
+        print(f"  version disagreement: {', '.join(disagreement['versions'])} at {', '.join(disagreement['location_paths'])}")
+    for source in preview["unaffected_sources"]:
+        print(
+            f"  unaffected: {source['component']['purl']} {source['version']} "
+            f"{source['source_path']} :: {source['location_path']} ({'; '.join(source['reasons'])})"
+        )
     for affected in preview["affected_projects"]:
         marker = "CONFLICT" if affected["would_conflict"] else "unified"
         print(f"  project {affected['project_id']}: {', '.join(affected['versions'])} [{marker}]")
@@ -94,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--to", dest="to_ref", required=True)
         command_parser.add_argument("--by", default="operator")
         command_parser.add_argument("--json", action="store_true")
+        command_parser.add_argument("--project")
+        command_parser.add_argument("--project-version")
+        command_parser.add_argument("--min-version")
+        command_parser.add_argument("--max-version")
+        command_parser.add_argument("--source", action="append", dest="sources")
     list_parser = alias_subparsers.add_parser("list")
     list_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
     list_parser.add_argument("--status", choices=("pending", "approved", "revoked", "all"), default="all")
@@ -136,27 +163,62 @@ def main(argv: list[str] | None = None) -> int:
                     for row in aliases:
                         print(f"#{row['id']} [{row['status']}] ({row['origin']}) {row['from_purl']} <-> {row['to_purl']}")
             elif args.alias_command == "preview":
-                preview = store.alias_preview(args.from_ref, args.to_ref)
+                preview = store.alias_preview(
+                    args.from_ref,
+                    args.to_ref,
+                    project=args.project,
+                    project_version=args.project_version,
+                    min_version=args.min_version,
+                    max_version=args.max_version,
+                    sources=args.sources,
+                )
                 if args.json:
                     print(json.dumps(preview, ensure_ascii=False, indent=2))
                 else:
                     _print_preview(preview)
             elif args.alias_command == "propose":
-                result = store.propose_alias(args.from_ref, args.to_ref, created_by=args.by)
+                result = store.propose_alias(
+                    args.from_ref,
+                    args.to_ref,
+                    created_by=args.by,
+                    project=args.project,
+                    project_version=args.project_version,
+                    min_version=args.min_version,
+                    max_version=args.max_version,
+                    sources=args.sources,
+                )
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
                 else:
                     print(f"proposed edge #{result['edge_id']} [{result['status']}]")
                     _print_preview(result["preview"])
             elif args.alias_command == "approve":
-                result = store.approve_alias(args.from_ref, args.to_ref, decided_by=args.by)
+                result = store.approve_alias(
+                    args.from_ref,
+                    args.to_ref,
+                    decided_by=args.by,
+                    project=args.project,
+                    project_version=args.project_version,
+                    min_version=args.min_version,
+                    max_version=args.max_version,
+                    sources=args.sources,
+                )
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
                 else:
                     _print_preview(result["preview"])
                     print(f"approved; refreshed projects: {result['refreshed_projects']}")
             elif args.alias_command == "revoke":
-                result = store.revoke_alias(args.from_ref, args.to_ref, decided_by=args.by)
+                result = store.revoke_alias(
+                    args.from_ref,
+                    args.to_ref,
+                    decided_by=args.by,
+                    project=args.project,
+                    project_version=args.project_version,
+                    min_version=args.min_version,
+                    max_version=args.max_version,
+                    sources=args.sources,
+                )
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2))
                 else:

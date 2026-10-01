@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -163,6 +164,21 @@ class AliasWorkflowTests(unittest.TestCase):
         purls = {component["purl"] for component in report["components"]}
         self.assertEqual(purls, {"pkg:pypi/requests", "pkg:npm/requests"})
 
+    def test_manual_alias_requires_explicit_project_and_source(self) -> None:
+        store = self._store_with_project()
+        self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("maven", "com.a:lib", "1.0", "build-a/lib"),
+                self._evidence("maven", "com.b:lib", "1.0", "build-b/lib"),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "explicit --project"):
+            store.approve_alias("maven:com.a:lib", "maven:com.b:lib", sources=("h1",))
+        with self.assertRaisesRegex(ValueError, "explicit --source"):
+            store.approve_alias("maven:com.a:lib", "maven:com.b:lib", project="demo")
+
     def test_version_conflict_survives_alias_and_revoke_restores_evidence(self) -> None:
         store = self._store_with_project()
         project_id = self._add_source(
@@ -176,7 +192,12 @@ class AliasWorkflowTests(unittest.TestCase):
         preview = store.alias_preview("maven:com.example:new-core", "maven:com.example:old-core")
         self.assertTrue(preview["allowed"])
         self.assertTrue(preview["affected_projects"][0]["would_conflict"])
-        result = store.approve_alias("maven:com.example:new-core", "maven:com.example:old-core")
+        result = store.approve_alias(
+            "maven:com.example:new-core",
+            "maven:com.example:old-core",
+            project="demo",
+            sources=("h1",),
+        )
         self.assertEqual(result["refreshed_projects"], [project_id])
         report = store.project_report("demo")
         self.assertEqual(len(report["components"]), 1)
@@ -193,7 +214,12 @@ class AliasWorkflowTests(unittest.TestCase):
         history_before_revoke = store.project_history("demo")
         self.assertTrue(any(entry["reason"] == "alias-approve" for entry in history_before_revoke))
 
-        store.revoke_alias("maven:com.example:new-core", "maven:com.example:old-core")
+        store.revoke_alias(
+            "maven:com.example:new-core",
+            "maven:com.example:old-core",
+            project="demo",
+            sources=("h1",),
+        )
         report_after = store.project_report("demo")
         self.assertEqual(len(report_after["components"]), 2)
         self.assertEqual(
@@ -260,11 +286,124 @@ class AliasWorkflowTests(unittest.TestCase):
                 self._evidence("maven", "com.b:lib", "1.0", "build-b/lib"),
             ),
         )
-        proposed = store.propose_alias("maven:com.a:lib", "maven:com.b:lib")
+        proposed = store.propose_alias("maven:com.a:lib", "maven:com.b:lib", project="demo", sources=("h1",))
         self.assertEqual(proposed["status"], "pending")
         self.assertEqual(len(store.project_report("demo")["components"]), 2)
-        store.approve_alias("maven:com.a:lib", "maven:com.b:lib")
+        store.approve_alias("maven:com.a:lib", "maven:com.b:lib", project="demo", sources=("h1",))
         self.assertEqual(len(store.project_report("demo")["components"]), 1)
+
+    def test_manual_alias_scope_does_not_leak_project_version_or_source(self) -> None:
+        store = self._store_with_project("first")
+        first_id = self._add_source(
+            store,
+            "h-first",
+            (
+                self._evidence("maven", "com.a:lib", "1.0", "first/in/a", aliases=()),
+                self._evidence("maven", "com.b:lib", "1.0", "first/in/b"),
+            ),
+        )
+        self._add_source(
+            store,
+            "h-other",
+            (
+                self._evidence("maven", "com.a:lib", "2.0", "first/out/a"),
+                self._evidence("maven", "com.b:lib", "2.0", "first/out/b"),
+            ),
+        )
+        second_id = store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES('second', '1', 'now') RETURNING id"
+        ).fetchone()[0]
+        source_id = store.conn.execute(
+            "INSERT INTO manifest_sources(project_id, source_path, manifest_type, content_hash, imported_at) "
+            "VALUES(?, 'second.json', 'test', 'h-second', 'now') RETURNING id",
+            (second_id,),
+        ).fetchone()[0]
+        store._insert_evidence(
+            store.conn.cursor(),
+            second_id,
+            source_id,
+            (
+                self._evidence("maven", "com.a:lib", "1.0", "second/a"),
+                self._evidence("maven", "com.b:lib", "1.0", "second/b"),
+            ),
+        )
+        store.conn.commit()
+        store.refresh_project_components(second_id)
+
+        preview = store.alias_preview(
+            "maven:com.a:lib",
+            "maven:com.b:lib",
+            project="first",
+            min_version="1.0",
+            max_version="1.0",
+            sources=("h-first",),
+        )
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["merged_groups"][0]["versions"], ["1.0"])
+        self.assertEqual(
+            {(item["component"]["canonical_name"], item["version"]) for item in preview["unaffected_sources"]},
+            {
+                ("com.a:lib", "2.0"),
+                ("com.b:lib", "2.0"),
+            },
+        )
+        store.approve_alias(
+            "maven:com.a:lib",
+            "maven:com.b:lib",
+            project="first",
+            min_version="1.0",
+            max_version="1.0",
+            sources=("h-first",),
+        )
+
+        first_report = store.project_report("first")
+        merged = next(component for component in first_report["components"] if len(component["member_components"]) == 2)
+        self.assertEqual(json.loads(merged["versions_json"]), ["1.0"])
+        self.assertEqual(merged["location_paths"], ["first/in/a", "first/in/b"])
+        self.assertEqual(
+            {(component["canonical_name"], component["location_paths"][0]) for component in first_report["components"] if len(component["member_components"]) == 1},
+            {
+                ("com.a:lib", "first/out/a"),
+                ("com.b:lib", "first/out/b"),
+            },
+        )
+        second_report = store.project_report("second")
+        self.assertEqual(len(second_report["components"]), 2)
+        self.assertEqual(first_id, 1)
+        self.assertEqual(len(store.project_history("first")), 1)
+
+    def test_revoking_middle_indirect_edge_recomputes_groups_and_paths(self) -> None:
+        store = self._store_with_project()
+        self._add_source(
+            store,
+            "h1",
+            (
+                self._evidence("maven", "com.a:lib", "1.0", "path/a"),
+                self._evidence("maven", "com.b:lib", "1.0", "path/b"),
+                self._evidence("maven", "com.c:lib", "1.0", "path/c"),
+            ),
+        )
+        store.approve_alias("maven:com.a:lib", "maven:com.b:lib", project="demo", sources=("h1",))
+        store.approve_alias("maven:com.b:lib", "maven:com.c:lib", project="demo", sources=("h1",))
+        report = store.project_report("demo")
+        self.assertEqual(len(report["components"]), 1)
+        self.assertEqual(
+            {member["canonical_name"] for member in report["components"][0]["member_components"]},
+            {"com.a:lib", "com.b:lib", "com.c:lib"},
+        )
+
+        store.revoke_alias("maven:com.a:lib", "maven:com.b:lib", sources=("h1",))
+        after = store.project_report("demo")
+        self.assertEqual(len(after["components"]), 2)
+        by_members = {
+            tuple(member["canonical_name"] for member in component["member_components"]): component
+            for component in after["components"]
+        }
+        self.assertEqual(set(by_members), {("com.a:lib",), ("com.b:lib", "com.c:lib")})
+        self.assertEqual(
+            {item["location_path"] for item in after["evidence"]},
+            {"path/a", "path/b", "path/c"},
+        )
 
 
 if __name__ == "__main__":
