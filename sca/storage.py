@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from .identity import component_key, identify
 from .models import DependencyEvidence, ParsedManifest
+from .versioning import in_range
 
 
 SCHEMA = """
@@ -46,10 +47,14 @@ CREATE TABLE IF NOT EXISTS alias_edges (
     from_component_id INTEGER NOT NULL REFERENCES components(id),
     to_component_id INTEGER NOT NULL REFERENCES components(id),
     origin TEXT NOT NULL CHECK(origin IN ('manifest', 'manual')),
-    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'revoked')),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'revoked', 'rejected')),
     created_at TEXT NOT NULL,
     decided_at TEXT,
     decided_by TEXT,
+    version_range TEXT NOT NULL DEFAULT '*',
+    sources_json TEXT NOT NULL DEFAULT '["*"]',
+    note TEXT,
+    reject_reason TEXT,
     UNIQUE(from_component_id, to_component_id)
 );
 
@@ -103,6 +108,42 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate_alias_edges()
+
+    def _migrate_alias_edges(self) -> None:
+        table_sql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alias_edges'"
+        ).fetchone()[0]
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(alias_edges)")}
+        needed = {"version_range", "sources_json", "note", "reject_reason"}
+        if needed <= columns and "'rejected'" in table_sql:
+            return
+        self.conn.executescript(
+            """
+            ALTER TABLE alias_edges RENAME TO alias_edges_legacy;
+            CREATE TABLE alias_edges (
+                id INTEGER PRIMARY KEY,
+                from_component_id INTEGER NOT NULL REFERENCES components(id),
+                to_component_id INTEGER NOT NULL REFERENCES components(id),
+                origin TEXT NOT NULL CHECK(origin IN ('manifest', 'manual')),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'revoked', 'rejected')),
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                decided_by TEXT,
+                version_range TEXT NOT NULL DEFAULT '*',
+                sources_json TEXT NOT NULL DEFAULT '["*"]',
+                note TEXT,
+                reject_reason TEXT,
+                UNIQUE(from_component_id, to_component_id)
+            );
+            INSERT INTO alias_edges(id, from_component_id, to_component_id, origin, status,
+                                    created_at, decided_at, decided_by)
+                SELECT id, from_component_id, to_component_id, origin, status,
+                       created_at, decided_at, decided_by FROM alias_edges_legacy;
+            DROP TABLE alias_edges_legacy;
+            """
+        )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -279,13 +320,33 @@ class Store:
         )
         return int(cursor.fetchone()[0])
 
-    def _approved_edges(self, cursor: sqlite3.Cursor) -> list[tuple[int, int]]:
-        rows = cursor.execute(
-            "SELECT from_component_id, to_component_id FROM alias_edges WHERE status='approved'"
+    def _approved_edge_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM alias_edges WHERE status='approved' ORDER BY id"
         ).fetchall()
-        return [(int(row[0]), int(row[1])) for row in rows]
 
-    def alias_groups(self) -> dict[int, int]:
+    @staticmethod
+    def _edge_sources(edge: sqlite3.Row) -> list[str]:
+        try:
+            sources = json.loads(edge["sources_json"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            sources = ["*"]
+        return sources or ["*"]
+
+    def _edge_applies_to_project(self, edge: sqlite3.Row, project_name: str) -> bool:
+        sources = self._edge_sources(edge)
+        return sources == ["*"] or project_name in sources
+
+    def _component_versions_in_project(self, component_id: int, project_id: int) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT version FROM dependency_evidence WHERE component_id=? AND project_id=?",
+            (component_id, project_id),
+        ).fetchall()
+        return [row[0] for row in rows if row[0]]
+
+    def _compute_groups(
+        self, edges: list[sqlite3.Row], project: tuple[int, str] | None = None
+    ) -> dict[int, int]:
         parent: dict[int, int] = {}
 
         def find(value: int) -> int:
@@ -300,15 +361,44 @@ class Store:
             if left_root != right_root:
                 parent[max(left_root, right_root)] = min(left_root, right_root)
 
-        for left, right in self._approved_edges(self.conn.cursor()):
-            union(left, right)
-        groups = {component_id: find(component_id) for component_id in parent}
-        return groups
+        for edge in edges:
+            from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
+            if project is not None:
+                project_id, project_name = project
+                if not self._edge_applies_to_project(edge, project_name):
+                    continue
+                version_range = edge["version_range"] or "*"
+                from_versions = self._component_versions_in_project(from_id, project_id)
+                to_versions = self._component_versions_in_project(to_id, project_id)
+                if not any(in_range(version, version_range) for version in from_versions):
+                    continue
+                if not any(in_range(version, version_range) for version in to_versions):
+                    continue
+            union(from_id, to_id)
+        return {component_id: find(component_id) for component_id in parent}
 
-    def alias_preview(self, first_ref: str, second_ref: str) -> dict[str, Any]:
+    def alias_groups(self, project_id: int | None = None) -> dict[int, int]:
+        project = None
+        if project_id is not None:
+            row = self.conn.execute(
+                "SELECT id, name FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if row is not None:
+                project = (int(row["id"]), row["name"])
+        return self._compute_groups(self._approved_edge_rows(), project)
+
+    def alias_preview(
+        self,
+        first_ref: str,
+        second_ref: str,
+        *,
+        version_range: str = "*",
+        sources: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         first = self.resolve_component(first_ref)
         second = self.resolve_component(second_ref)
         first_id, second_id = int(first["id"]), int(second["id"])
+        scope_sources = sorted(sources) if sources else ["*"]
         allowed = True
         reasons: list[str] = []
         if first_id == second_id:
@@ -317,77 +407,148 @@ class Store:
         if first["ecosystem"] != second["ecosystem"]:
             allowed = False
             reasons.append("components belong to different ecosystems")
-        groups = self.alias_groups()
-        root = groups.get(first_id, first_id)
-        group_ids = {component_id for component_id, group_root in groups.items() if group_root == root} | {first_id}
-        group_ids.add(second_id)
-        placeholders = ",".join("?" for _ in group_ids)
-        version_rows = self.conn.execute(
-            f"SELECT project_id, COUNT(DISTINCT version) AS version_count, "
-            f"json_group_array(DISTINCT version) AS versions "
-            f"FROM dependency_evidence WHERE component_id IN ({placeholders}) GROUP BY project_id",
-            tuple(group_ids),
+        try:
+            in_range("0", version_range)
+        except ValueError as exc:
+            allowed = False
+            reasons.append(f"invalid version range: {exc}")
+        candidate = {
+            "from_component_id": first_id,
+            "to_component_id": second_id,
+            "version_range": version_range or "*",
+            "sources_json": json.dumps(scope_sources),
+        }
+        simulated = list(self._approved_edge_rows()) + [candidate]
+        project_rows = self.conn.execute(
+            "SELECT DISTINCT p.id, p.name FROM projects p "
+            "JOIN dependency_evidence e ON e.project_id=p.id "
+            "WHERE e.component_id IN (?, ?) ORDER BY p.id",
+            (first_id, second_id),
         ).fetchall()
         affected_projects = []
-        for row in version_rows:
-            versions = sorted(value for value in json.loads(row["versions"]) if value)
-            would_conflict = int(row["version_count"]) > 1
+        member_ids: set[int] = {first_id, second_id}
+        for project_row in project_rows:
+            project_id, project_name = int(project_row["id"]), project_row["name"]
+            in_scope = self._edge_applies_to_project(candidate, project_name)
+            groups = self._compute_groups(simulated, (project_id, project_name))
+            root = groups.get(first_id, first_id)
+            merged = in_scope and root == groups.get(second_id, second_id)
+            group_ids = {
+                component_id for component_id, group_root in groups.items() if group_root == root
+            } | {first_id}
+            if merged:
+                group_ids.add(second_id)
+            member_ids |= group_ids
+            placeholders = ",".join("?" for _ in group_ids)
+            version_rows = self.conn.execute(
+                f"SELECT DISTINCT version FROM dependency_evidence "
+                f"WHERE project_id=? AND component_id IN ({placeholders})",
+                (project_id, *sorted(group_ids)),
+            ).fetchall()
+            versions = sorted(row[0] for row in version_rows if row[0])
+            would_conflict = merged and len(versions) > 1
             if would_conflict:
                 reasons.append(
-                    f"project {row['project_id']} would retain a version conflict: {', '.join(versions)}"
+                    f"project {project_name} would retain a version conflict: {', '.join(versions)}"
                 )
             affected_projects.append(
-                {"project_id": int(row["project_id"]), "versions": versions, "would_conflict": would_conflict}
+                {
+                    "project_id": project_id,
+                    "project": project_name,
+                    "in_scope": in_scope,
+                    "merged": merged,
+                    "versions": versions,
+                    "would_conflict": would_conflict,
+                }
             )
         existing = self.conn.execute(
             "SELECT origin, status FROM alias_edges WHERE from_component_id=? AND to_component_id=?",
             self._ordered(first_id, second_id),
         ).fetchone()
         cursor = self.conn.cursor()
-        members = [dict(self._component_row(cursor, component_id)) for component_id in sorted(group_ids)]
+        members = [dict(self._component_row(cursor, component_id)) for component_id in sorted(member_ids)]
         return {
             "allowed": allowed,
             "reasons": reasons,
             "from": dict(first),
             "to": dict(second),
+            "version_range": version_range or "*",
+            "sources": scope_sources,
             "group_members": members,
             "affected_projects": affected_projects,
             "existing_edge": dict(existing) if existing else None,
         }
 
-    def approve_alias(self, first_ref: str, second_ref: str, *, decided_by: str = "operator") -> dict[str, Any]:
-        preview = self.alias_preview(first_ref, second_ref)
+    def approve_alias(
+        self,
+        first_ref: str,
+        second_ref: str,
+        *,
+        decided_by: str = "operator",
+        version_range: str = "*",
+        sources: Iterable[str] | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        from_id, to_id = self._ordered(
+            int(self.resolve_component(first_ref)["id"]), int(self.resolve_component(second_ref)["id"])
+        )
+        existing = self.conn.execute(
+            "SELECT id, status FROM alias_edges WHERE from_component_id=? AND to_component_id=?",
+            (from_id, to_id),
+        ).fetchone()
+        if existing is not None and existing["status"] == "pending":
+            result = self.approve_edges([int(existing["id"])], decided_by=decided_by, note=note)
+            preview = self.alias_preview(first_ref, second_ref)
+            return {
+                "preview": preview,
+                "refreshed_projects": result["refreshed_projects"],
+                "edge_id": int(existing["id"]),
+            }
+        preview = self.alias_preview(first_ref, second_ref, version_range=version_range, sources=sources)
         if not preview["allowed"]:
             raise ValueError("; ".join(preview["reasons"]))
-        first_id, second_id = int(preview["from"]["id"]), int(preview["to"]["id"])
-        from_id, to_id = self._ordered(first_id, second_id)
+        scope_sources = sorted(sources) if sources else ["*"]
         now = utc_now()
         self.conn.execute(
-            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by) "
-            "VALUES(?, ?, 'manual', 'approved', ?, ?, ?) "
+            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by, version_range, sources_json, note) "
+            "VALUES(?, ?, 'manual', 'approved', ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(from_component_id, to_component_id) DO UPDATE SET "
-            "status='approved', decided_at=excluded.decided_at, decided_by=excluded.decided_by",
-            (from_id, to_id, now, now, decided_by),
+            "status='approved', decided_at=excluded.decided_at, decided_by=excluded.decided_by, "
+            "note=COALESCE(excluded.note, alias_edges.note)",
+            (from_id, to_id, now, now, decided_by, version_range or "*", json.dumps(scope_sources), note),
         )
         self.conn.commit()
-        affected = self._refresh_affected_projects({first_id, second_id})
+        affected = self._refresh_affected_projects({from_id, to_id})
         return {"preview": preview, "refreshed_projects": affected}
 
-    def propose_alias(self, first_ref: str, second_ref: str, *, created_by: str = "operator") -> dict[str, Any]:
-        preview = self.alias_preview(first_ref, second_ref)
+    def propose_alias(
+        self,
+        first_ref: str,
+        second_ref: str,
+        *,
+        created_by: str = "operator",
+        version_range: str = "*",
+        sources: Iterable[str] | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        preview = self.alias_preview(first_ref, second_ref, version_range=version_range, sources=sources)
         if not preview["allowed"]:
             raise ValueError("; ".join(preview["reasons"]))
         first_id, second_id = int(preview["from"]["id"]), int(preview["to"]["id"])
         from_id, to_id = self._ordered(first_id, second_id)
+        scope_sources = sorted(sources) if sources else ["*"]
         now = utc_now()
         row = self.conn.execute(
-            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by) "
-            "VALUES(?, ?, 'manual', 'pending', ?, NULL, ?) "
+            "INSERT INTO alias_edges(from_component_id, to_component_id, origin, status, created_at, decided_at, decided_by, version_range, sources_json, note) "
+            "VALUES(?, ?, 'manual', 'pending', ?, NULL, ?, ?, ?, ?) "
             "ON CONFLICT(from_component_id, to_component_id) DO UPDATE SET "
-            "origin='manual', status=CASE WHEN alias_edges.status='revoked' THEN 'pending' ELSE alias_edges.status END, "
-            "decided_by=CASE WHEN alias_edges.status='revoked' THEN excluded.decided_by ELSE alias_edges.decided_by END "
+            "origin='manual', status=CASE WHEN alias_edges.status IN ('revoked', 'rejected') THEN 'pending' ELSE alias_edges.status END, "
+            "decided_by=CASE WHEN alias_edges.status IN ('revoked', 'rejected') THEN excluded.decided_by ELSE alias_edges.decided_by END, "
+            "version_range=CASE WHEN alias_edges.status IN ('revoked', 'rejected') THEN excluded.version_range ELSE alias_edges.version_range END, "
+            "sources_json=CASE WHEN alias_edges.status IN ('revoked', 'rejected') THEN excluded.sources_json ELSE alias_edges.sources_json END, "
+            "reject_reason=CASE WHEN alias_edges.status IN ('revoked', 'rejected') THEN NULL ELSE alias_edges.reject_reason END "
             "RETURNING id, status",
-            (from_id, to_id, now, created_by),
+            (from_id, to_id, now, created_by, version_range or "*", json.dumps(scope_sources), note),
         ).fetchone()
         self.conn.commit()
         return {"edge_id": int(row[0]), "status": row[1], "preview": preview}
@@ -402,19 +563,245 @@ class Store:
         ).fetchone()
         if row is None:
             raise KeyError(f"alias edge not found: {first_ref} <-> {second_ref}")
+        return self.revoke_edge(int(row["id"]), decided_by=decided_by)
+
+    def revoke_edge(self, edge_id: int, *, decided_by: str = "operator") -> dict[str, Any]:
+        row = self._edge_row(edge_id)
+        from_id, to_id = int(row["from_component_id"]), int(row["to_component_id"])
         affected_components = self._edge_component_group(from_id) | self._edge_component_group(to_id)
         self.conn.execute(
             "UPDATE alias_edges SET status='revoked', decided_at=?, decided_by=? WHERE id=?",
-            (utc_now(), decided_by, int(row["id"])),
+            (utc_now(), decided_by, edge_id),
         )
         self.conn.commit()
         affected = self._refresh_affected_projects(affected_components, reason="alias-revoke")
-        return {"revoked_edge": int(row["id"]), "refreshed_projects": affected}
+        recheck = self._recheck_pending_after_revoke({from_id, to_id})
+        return {
+            "revoked_edge": edge_id,
+            "refreshed_projects": affected,
+            "affected_pending": recheck["affected_pending"],
+            "remaining_preview": recheck["remaining_preview"],
+        }
+
+    def _recheck_pending_after_revoke(self, revoked_component_ids: set[int]) -> dict[str, Any]:
+        pending = self.pending_edges()
+        if not pending:
+            return {"affected_pending": [], "remaining_preview": {"candidates": [], "conflicts": []}}
+        related = self._connected_edges(revoked_component_ids)
+        affected = [edge for edge in pending if edge["id"] in related]
+        return {"affected_pending": affected, "remaining_preview": self.joint_preview()}
+
+    def _connected_edges(self, seed_component_ids: set[int]) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT id, from_component_id, to_component_id FROM alias_edges WHERE status IN ('approved', 'pending')"
+        ).fetchall()
+        adjacency: dict[int, list[int]] = {}
+        edge_by_pair: list[tuple[int, int, int]] = []
+        for row in rows:
+            left, right = int(row["from_component_id"]), int(row["to_component_id"])
+            adjacency.setdefault(left, []).append(right)
+            adjacency.setdefault(right, []).append(left)
+            edge_by_pair.append((int(row["id"]), left, right))
+        reachable = set(seed_component_ids)
+        frontier = list(seed_component_ids)
+        while frontier:
+            current = frontier.pop()
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in reachable:
+                    reachable.add(neighbor)
+                    frontier.append(neighbor)
+        return {
+            edge_id
+            for edge_id, left, right in edge_by_pair
+            if left in reachable and right in reachable
+        }
 
     def _edge_component_group(self, component_id: int) -> set[int]:
         groups = self.alias_groups()
         root = groups.get(component_id, component_id)
         return {item for item, group_root in groups.items() if group_root == root} | {root, component_id}
+
+    def _edge_row(self, edge_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM alias_edges WHERE id=?", (edge_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"alias edge not found: #{edge_id}")
+        return row
+
+    def edge_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        cursor = self.conn.cursor()
+        first = self._component_row(cursor, int(row["from_component_id"]))
+        second = self._component_row(cursor, int(row["to_component_id"]))
+        return {
+            "id": int(row["id"]),
+            "origin": row["origin"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "decided_at": row["decided_at"],
+            "decided_by": row["decided_by"],
+            "version_range": row["version_range"],
+            "sources": self._edge_sources(row),
+            "note": row["note"],
+            "reject_reason": row["reject_reason"],
+            "from_purl": first["purl"],
+            "to_purl": second["purl"],
+            "from_ref": f"{first['ecosystem']}:{first['canonical_name']}",
+            "to_ref": f"{second['ecosystem']}:{second['canonical_name']}",
+        }
+
+    def pending_edges(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM alias_edges WHERE status='pending' ORDER BY id"
+        ).fetchall()
+        return [self.edge_dict(row) for row in rows]
+
+    def list_edges(self, status: str = "all") -> list[dict[str, Any]]:
+        if status == "all":
+            rows = self.conn.execute("SELECT * FROM alias_edges ORDER BY id").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM alias_edges WHERE status=? ORDER BY id", (status,)
+            ).fetchall()
+        return [self.edge_dict(row) for row in rows]
+
+    def joint_preview(self, edge_ids: list[int] | None = None) -> dict[str, Any]:
+        if edge_ids is None:
+            candidate_rows = self.conn.execute(
+                "SELECT * FROM alias_edges WHERE status='pending' ORDER BY id"
+            ).fetchall()
+        else:
+            candidate_rows = []
+            for edge_id in edge_ids:
+                row = self._edge_row(edge_id)
+                if row["status"] != "pending":
+                    raise ValueError(f"edge #{edge_id} is {row['status']}, not pending")
+                candidate_rows.append(row)
+        approved = self._approved_edge_rows()
+        simulated = list(approved) + list(candidate_rows)
+        candidate_component_ids = {
+            int(row[key])
+            for row in candidate_rows
+            for key in ("from_component_id", "to_component_id")
+        }
+        conflicts: list[dict[str, Any]] = []
+        projects_seen: list[dict[str, Any]] = []
+        if candidate_component_ids:
+            placeholders = ",".join("?" for _ in candidate_component_ids)
+            project_rows = self.conn.execute(
+                f"SELECT DISTINCT p.id, p.name FROM projects p "
+                f"JOIN dependency_evidence e ON e.project_id=p.id "
+                f"WHERE e.component_id IN ({placeholders}) ORDER BY p.id",
+                tuple(sorted(candidate_component_ids)),
+            ).fetchall()
+            for project_row in project_rows:
+                project_id, project_name = int(project_row["id"]), project_row["name"]
+                groups = self._compute_groups(simulated, (project_id, project_name))
+                evidence_rows = self.conn.execute(
+                    "SELECT e.component_id, e.version, e.location_path, s.source_path, c.canonical_name "
+                    "FROM dependency_evidence e "
+                    "JOIN manifest_sources s ON s.id=e.source_id "
+                    "JOIN components c ON c.id=e.component_id "
+                    "WHERE e.project_id=?",
+                    (project_id,),
+                ).fetchall()
+                by_root: dict[int, dict[str, Any]] = {}
+                for evidence in evidence_rows:
+                    component_id = int(evidence["component_id"])
+                    root = groups.get(component_id, component_id)
+                    bucket = by_root.setdefault(root, {"components": set(), "versions": set(), "evidence": []})
+                    bucket["components"].add(component_id)
+                    if evidence["version"]:
+                        bucket["versions"].add(evidence["version"])
+                    bucket["evidence"].append(
+                        {
+                            "canonical_name": evidence["canonical_name"],
+                            "version": evidence["version"],
+                            "source_path": evidence["source_path"],
+                            "location_path": evidence["location_path"],
+                        }
+                    )
+                project_conflict_roots = []
+                for root, bucket in by_root.items():
+                    if len(bucket["versions"]) <= 1 or len(bucket["components"]) <= 1:
+                        continue
+                    contributing = []
+                    involves_proposal = False
+                    for edge in simulated:
+                        left = groups.get(int(edge["from_component_id"]), int(edge["from_component_id"]))
+                        right = groups.get(int(edge["to_component_id"]), int(edge["to_component_id"]))
+                        if left == root and right == root:
+                            is_candidate = edge in candidate_rows
+                            involves_proposal = involves_proposal or is_candidate
+                            entry = self.edge_dict(edge)
+                            entry["role"] = "proposal" if is_candidate else "approved"
+                            contributing.append(entry)
+                    if not involves_proposal:
+                        continue
+                    project_conflict_roots.append(root)
+                    conflicts.append(
+                        {
+                            "project": project_name,
+                            "project_id": project_id,
+                            "versions": sorted(bucket["versions"]),
+                            "components": sorted(bucket["components"]),
+                            "proposals": contributing,
+                            "evidence": bucket["evidence"],
+                        }
+                    )
+                projects_seen.append(
+                    {
+                        "project": project_name,
+                        "project_id": project_id,
+                        "conflict_groups": len(project_conflict_roots),
+                    }
+                )
+        return {
+            "candidates": [self.edge_dict(row) for row in candidate_rows],
+            "projects": projects_seen,
+            "conflicts": conflicts,
+        }
+
+    def approve_edges(
+        self, edge_ids: list[int], *, decided_by: str = "operator", note: str | None = None
+    ) -> dict[str, Any]:
+        rows = []
+        for edge_id in edge_ids:
+            row = self._edge_row(edge_id)
+            if row["status"] != "pending":
+                raise ValueError(f"edge #{edge_id} is {row['status']}, not pending")
+            rows.append(row)
+        now = utc_now()
+        affected_components: set[int] = set()
+        approved = []
+        for row in rows:
+            self.conn.execute(
+                "UPDATE alias_edges SET status='approved', decided_at=?, decided_by=?, "
+                "note=COALESCE(?, note) WHERE id=?",
+                (now, decided_by, note, int(row["id"])),
+            )
+            affected_components.add(int(row["from_component_id"]))
+            affected_components.add(int(row["to_component_id"]))
+            approved.append(self.edge_dict(self._edge_row(int(row["id"]))))
+        self.conn.commit()
+        refreshed = self._refresh_affected_projects(affected_components, reason="alias-approve")
+        remaining = self.pending_edges()
+        remaining_preview = self.joint_preview() if remaining else {"candidates": [], "conflicts": []}
+        return {
+            "approved": approved,
+            "refreshed_projects": refreshed,
+            "remaining_pending": remaining,
+            "remaining_preview": remaining_preview,
+        }
+
+    def reject_edge(self, edge_id: int, reason: str, *, decided_by: str = "operator") -> dict[str, Any]:
+        row = self._edge_row(edge_id)
+        if row["status"] != "pending":
+            raise ValueError(f"edge #{edge_id} is {row['status']}, not pending")
+        self.conn.execute(
+            "UPDATE alias_edges SET status='rejected', reject_reason=?, decided_at=?, decided_by=? WHERE id=?",
+            (reason, utc_now(), decided_by, edge_id),
+        )
+        self.conn.commit()
+        return self.edge_dict(self._edge_row(edge_id))
 
     def _refresh_affected_projects(self, component_ids: set[int], *, reason: str = "alias-approve") -> list[int]:
         if not component_ids:
@@ -431,7 +818,7 @@ class Store:
         return project_ids
 
     def refresh_project_components(self, project_id: int | None = None) -> None:
-        groups = self.alias_groups()
+        groups = self.alias_groups(project_id)
         where = "WHERE e.project_id=?" if project_id is not None else ""
         params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
         if project_id is not None:
@@ -485,7 +872,7 @@ class Store:
         ).fetchone()
         if project is None:
             raise KeyError(f"project not found: {project_name}")
-        groups = self.alias_groups()
+        groups = self.alias_groups(project["id"])
         component_rows = self.conn.execute("SELECT * FROM components").fetchall()
         members: dict[int, list[dict[str, Any]]] = {}
         for row in component_rows:
@@ -579,16 +966,4 @@ class Store:
         return history
 
     def pending_aliases(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            """
-            SELECT e.id, e.origin, e.status, e.created_at,
-                   c1.ecosystem AS from_ecosystem, c1.canonical_name AS from_name,
-                   c2.ecosystem AS to_ecosystem, c2.canonical_name AS to_name
-            FROM alias_edges e
-            JOIN components c1 ON c1.id=e.from_component_id
-            JOIN components c2 ON c2.id=e.to_component_id
-            WHERE e.status='pending'
-            ORDER BY e.id
-            """
-        ).fetchall()
-        return [dict(row) for row in rows]
+        return self.pending_edges()

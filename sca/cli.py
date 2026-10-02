@@ -60,15 +60,70 @@ def _print_preview(preview: dict) -> None:
     first, second = preview["from"], preview["to"]
     status = "ALLOWED" if preview["allowed"] else "REJECTED"
     print(f"[{status}] {first['purl']} <-> {second['purl']}")
+    print(f"  scope: versions={preview['version_range']} sources={', '.join(preview['sources'])}")
     for reason in preview["reasons"]:
         print(f"  - {reason}")
     for member in preview["group_members"]:
         print(f"  member: {member['purl']} ({member['display_name']})")
     for affected in preview["affected_projects"]:
         marker = "CONFLICT" if affected["would_conflict"] else "unified"
-        print(f"  project {affected['project_id']}: {', '.join(affected['versions'])} [{marker}]")
+        scope_note = "" if affected["in_scope"] else " (out of scope)"
+        print(f"  project {affected['project']}: {', '.join(affected['versions'])} [{marker}]{scope_note}")
     if preview["existing_edge"]:
         print(f"  existing edge: {preview['existing_edge']['origin']} / {preview['existing_edge']['status']}")
+
+
+def _print_edge(edge: dict) -> None:
+    print(
+        f"#{edge['id']} [{edge['status']}] ({edge['origin']}) {edge['from_purl']} <-> {edge['to_purl']} "
+        f"versions={edge['version_range']} sources={', '.join(edge['sources'])}"
+    )
+    if edge.get("note"):
+        print(f"    note: {edge['note']}")
+    if edge.get("reject_reason"):
+        print(f"    reject reason: {edge['reject_reason']}")
+
+
+def _print_joint_preview(preview: dict) -> None:
+    print(f"joint preview of {len(preview['candidates'])} pending proposal(s)")
+    for candidate in preview["candidates"]:
+        _print_edge(candidate)
+    if not preview["conflicts"]:
+        print("  no combined version conflicts")
+    for conflict in preview["conflicts"]:
+        print(
+            f"  CONFLICT in project {conflict['project']}: versions {', '.join(conflict['versions'])}"
+        )
+        for proposal in conflict["proposals"]:
+            print(
+                f"    via {proposal['role']} #{proposal['id']}: "
+                f"{proposal['from_purl']} <-> {proposal['to_purl']} [{proposal['status']}]"
+            )
+        for evidence in conflict["evidence"]:
+            print(
+                f"    evidence: {evidence['canonical_name']} {evidence['version']} "
+                f"{evidence['source_path']} :: {evidence['location_path']}"
+            )
+
+
+def _parse_edge_ids(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    return [int(item) for item in value.split(",") if item.strip()]
+
+
+def _print_revoke_result(result: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"revoked edge #{result['revoked_edge']}; refreshed projects: {result['refreshed_projects']}")
+    if result["affected_pending"]:
+        print("re-checked dependent proposals still pending:")
+        for edge in result["affected_pending"]:
+            _print_edge(edge)
+    if result["remaining_preview"]["candidates"]:
+        print("re-preview of remaining proposals:")
+        _print_joint_preview(result["remaining_preview"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,13 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
     for alias_command in ("propose", "preview", "approve", "revoke"):
         command_parser = alias_subparsers.add_parser(alias_command)
         command_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
-        command_parser.add_argument("--from", dest="from_ref", required=True)
-        command_parser.add_argument("--to", dest="to_ref", required=True)
+        command_parser.add_argument("--from", dest="from_ref")
+        command_parser.add_argument("--to", dest="to_ref")
         command_parser.add_argument("--by", default="operator")
         command_parser.add_argument("--json", action="store_true")
+        command_parser.add_argument("--versions", default="*", help="version range scope, e.g. '>=1.0,<2.0'")
+        command_parser.add_argument("--source", action="append", default=[], help="limit scope to a project name (repeatable)")
+        command_parser.add_argument("--note", help="rationale recorded with the decision")
+        command_parser.add_argument("--edge-id", type=int, help="act on a stored proposal by id")
+        command_parser.add_argument("--edges", help="comma-separated proposal ids for joint preview/approve")
+    reject_parser = alias_subparsers.add_parser("reject", help="reject a pending proposal with a reason")
+    reject_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    reject_parser.add_argument("--edge-id", type=int, required=True)
+    reject_parser.add_argument("--reason", required=True)
+    reject_parser.add_argument("--by", default="operator")
+    reject_parser.add_argument("--json", action="store_true")
     list_parser = alias_subparsers.add_parser("list")
     list_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
-    list_parser.add_argument("--status", choices=("pending", "approved", "revoked", "all"), default="all")
+    list_parser.add_argument("--status", choices=("pending", "approved", "revoked", "rejected", "all"), default="all")
     list_parser.add_argument("--json", action="store_true")
 
     history_parser = subparsers.add_parser("history", help="list stored scan conclusion snapshots")
@@ -117,50 +183,74 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "alias":
         with Store(args.db) as store:
             if args.alias_command == "list":
-                aliases = store.pending_aliases() if args.status == "pending" else store.conn.execute(
-                    """
-                    SELECT e.id, e.origin, e.status, e.created_at, e.decided_at,
-                           c1.purl AS from_purl, c2.purl AS to_purl
-                    FROM alias_edges e
-                    JOIN components c1 ON c1.id=e.from_component_id
-                    JOIN components c2 ON c2.id=e.to_component_id
-                    ORDER BY e.id
-                    """
-                ).fetchall()
-                aliases = [dict(row) for row in aliases]
-                if args.status != "all":
-                    aliases = [row for row in aliases if row["status"] == args.status]
+                aliases = store.list_edges(args.status)
                 if args.json:
                     print(json.dumps(aliases, ensure_ascii=False, indent=2))
                 else:
                     for row in aliases:
-                        print(f"#{row['id']} [{row['status']}] ({row['origin']}) {row['from_purl']} <-> {row['to_purl']}")
-            elif args.alias_command == "preview":
-                preview = store.alias_preview(args.from_ref, args.to_ref)
+                        _print_edge(row)
+            elif args.alias_command == "reject":
+                edge = store.reject_edge(args.edge_id, args.reason, decided_by=args.by)
                 if args.json:
-                    print(json.dumps(preview, ensure_ascii=False, indent=2))
+                    print(json.dumps(edge, ensure_ascii=False, indent=2))
                 else:
-                    _print_preview(preview)
-            elif args.alias_command == "propose":
-                result = store.propose_alias(args.from_ref, args.to_ref, created_by=args.by)
-                if args.json:
-                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                    _print_edge(edge)
+            else:
+                edge_ids = _parse_edge_ids(args.edges)
+                sources = args.source or None
+                if args.alias_command == "preview" and (edge_ids is not None or not args.from_ref):
+                    preview = store.joint_preview(edge_ids)
+                    if args.json:
+                        print(json.dumps(preview, ensure_ascii=False, indent=2))
+                    else:
+                        _print_joint_preview(preview)
+                elif args.alias_command == "approve" and edge_ids is not None:
+                    result = store.approve_edges(edge_ids, decided_by=args.by, note=args.note)
+                    if args.json:
+                        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                    else:
+                        for edge in result["approved"]:
+                            _print_edge(edge)
+                        print(f"approved; refreshed projects: {result['refreshed_projects']}")
+                        if result["remaining_pending"]:
+                            print("re-preview of remaining proposals:")
+                            _print_joint_preview(result["remaining_preview"])
+                elif args.alias_command == "revoke" and args.edge_id is not None:
+                    _print_revoke_result(store.revoke_edge(args.edge_id, decided_by=args.by), args.json)
                 else:
-                    print(f"proposed edge #{result['edge_id']} [{result['status']}]")
-                    _print_preview(result["preview"])
-            elif args.alias_command == "approve":
-                result = store.approve_alias(args.from_ref, args.to_ref, decided_by=args.by)
-                if args.json:
-                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-                else:
-                    _print_preview(result["preview"])
-                    print(f"approved; refreshed projects: {result['refreshed_projects']}")
-            elif args.alias_command == "revoke":
-                result = store.revoke_alias(args.from_ref, args.to_ref, decided_by=args.by)
-                if args.json:
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
-                else:
-                    print(f"revoked edge #{result['revoked_edge']}; refreshed projects: {result['refreshed_projects']}")
+                    if not args.from_ref or not args.to_ref:
+                        raise SystemExit("--from and --to are required for this alias operation")
+                    if args.alias_command == "preview":
+                        preview = store.alias_preview(
+                            args.from_ref, args.to_ref, version_range=args.versions, sources=sources
+                        )
+                        if args.json:
+                            print(json.dumps(preview, ensure_ascii=False, indent=2))
+                        else:
+                            _print_preview(preview)
+                    elif args.alias_command == "propose":
+                        result = store.propose_alias(
+                            args.from_ref, args.to_ref, created_by=args.by,
+                            version_range=args.versions, sources=sources, note=args.note,
+                        )
+                        if args.json:
+                            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                        else:
+                            print(f"proposed edge #{result['edge_id']} [{result['status']}]")
+                            _print_preview(result["preview"])
+                    elif args.alias_command == "approve":
+                        result = store.approve_alias(
+                            args.from_ref, args.to_ref, decided_by=args.by,
+                            version_range=args.versions, sources=sources, note=args.note,
+                        )
+                        if args.json:
+                            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                        else:
+                            _print_preview(result["preview"])
+                            print(f"approved; refreshed projects: {result['refreshed_projects']}")
+                    elif args.alias_command == "revoke":
+                        result = store.revoke_alias(args.from_ref, args.to_ref, decided_by=args.by)
+                        _print_revoke_result(result, args.json)
     elif args.command == "history":
         with Store(args.db) as store:
             history = store.project_history(args.project, args.project_version)

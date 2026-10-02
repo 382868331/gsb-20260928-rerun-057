@@ -269,3 +269,133 @@ class AliasWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopedAliasWorkflowTests(unittest.TestCase):
+    def _store(self) -> Store:
+        return Store()
+
+    def _project(self, store: Store, name: str) -> int:
+        return store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES(?, '1', 'now') RETURNING id",
+            (name,),
+        ).fetchone()[0]
+
+    def _evidence(self, name: str, version: str, location: str) -> DependencyEvidence:
+        return DependencyEvidence(
+            ecosystem="pypi",
+            name=name,
+            version=version,
+            dependency_type=DependencyType.DIRECT,
+            location_path=location,
+            raw={"name": name, "version": version},
+        )
+
+    def _add_source(self, store: Store, project_id: int, content_hash: str, evidence: tuple) -> None:
+        source_id = store.conn.execute(
+            "INSERT INTO manifest_sources(project_id, source_path, manifest_type, content_hash, imported_at) "
+            "VALUES(?, ?, 'test', ?, 'now') RETURNING id",
+            (project_id, f"src-{content_hash}.json", content_hash),
+        ).fetchone()[0]
+        cursor = store.conn.cursor()
+        store._insert_evidence(cursor, project_id, source_id, evidence)
+        store.conn.commit()
+        store.refresh_project_components(project_id)
+
+    def test_version_range_limits_merge(self) -> None:
+        store = self._store()
+        project_id = self._project(store, "demo")
+        self._add_source(store, project_id, "h1", (
+            self._evidence("alpha", "1.5", "build/a"),
+            self._evidence("beta", "2.5", "build/b"),
+        ))
+        store.propose_alias("pypi:alpha", "pypi:beta", version_range="<2.0")
+        store.approve_alias("pypi:alpha", "pypi:beta")
+        self.assertEqual(len(store.project_report("demo")["components"]), 2)
+        # re-proposing an approved edge with a wider range must not widen it
+        store.propose_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        store.approve_alias("pypi:alpha", "pypi:beta")
+        self.assertEqual(len(store.project_report("demo")["components"]), 2)
+        # widening requires explicit revoke and a fresh proposal
+        store.revoke_alias("pypi:alpha", "pypi:beta")
+        store.propose_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        store.approve_alias("pypi:alpha", "pypi:beta")
+        report = store.project_report("demo")
+        self.assertEqual(len(report["components"]), 1)
+        self.assertEqual(report["components"][0]["status"], "conflict")
+
+    def test_source_scope_does_not_leak_to_other_projects(self) -> None:
+        store = self._store()
+        demo_id = self._project(store, "demo")
+        other_id = self._project(store, "other")
+        for project_id, prefix in ((demo_id, "d"), (other_id, "o")):
+            self._add_source(store, project_id, f"h-{prefix}", (
+                self._evidence("foo", "1.0", f"{prefix}/foo"),
+                self._evidence("bar", "1.0", f"{prefix}/bar"),
+            ))
+        store.approve_alias("pypi:foo", "pypi:bar", sources=["demo"])
+        self.assertEqual(len(store.project_report("demo")["components"]), 1)
+        self.assertEqual(len(store.project_report("other")["components"]), 2)
+
+    def _chain_store(self) -> tuple[Store, int, int]:
+        store = self._store()
+        project_id = self._project(store, "demo")
+        self._add_source(store, project_id, "h1", (
+            self._evidence("alpha", "1.0", "build/alpha"),
+            self._evidence("beta", "1.0", "build/beta"),
+            self._evidence("gamma", "2.0", "build/gamma"),
+        ))
+        first = store.propose_alias("pypi:alpha", "pypi:beta", note="same project")
+        second = store.propose_alias("pypi:beta", "pypi:gamma", version_range=">=1.0")
+        return store, first["edge_id"], second["edge_id"]
+
+    def test_joint_preview_reports_chain_conflict_with_paths(self) -> None:
+        store, first_id, second_id = self._chain_store()
+        preview = store.joint_preview()
+        self.assertEqual([c["id"] for c in preview["candidates"]], [first_id, second_id])
+        self.assertEqual(len(preview["conflicts"]), 1)
+        conflict = preview["conflicts"][0]
+        self.assertEqual(conflict["versions"], ["1.0", "2.0"])
+        self.assertEqual(
+            {p["id"] for p in conflict["proposals"]}, {first_id, second_id},
+        )
+        locations = {item["location_path"] for item in conflict["evidence"]}
+        self.assertEqual(locations, {"build/alpha", "build/beta", "build/gamma"})
+        self.assertTrue(all(item["source_path"] for item in conflict["evidence"]))
+
+    def test_partial_approve_repreviews_remaining_without_widening_scope(self) -> None:
+        store, first_id, second_id = self._chain_store()
+        result = store.approve_edges([first_id], decided_by="reviewer", note="first only")
+        self.assertEqual([e["id"] for e in result["approved"]], [first_id])
+        remaining = result["remaining_pending"]
+        self.assertEqual([e["id"] for e in remaining], [second_id])
+        self.assertEqual(remaining[0]["version_range"], ">=1.0")
+        self.assertEqual(remaining[0]["sources"], ["*"])
+        repreview = result["remaining_preview"]
+        self.assertEqual([c["id"] for c in repreview["candidates"]], [second_id])
+        report = store.project_report("demo")
+        self.assertEqual(len(report["components"]), 2)
+        edge = store.edge_dict(store._edge_row(first_id))
+        self.assertEqual(edge["note"], "first only")
+
+    def test_revoke_rechecks_dependents_and_keeps_rationale(self) -> None:
+        store, first_id, second_id = self._chain_store()
+        store.approve_edges([first_id], note="approved basis")
+        store.reject_edge(second_id, "not adopted: versions diverge", decided_by="reviewer")
+        third = store.propose_alias("pypi:alpha", "pypi:gamma")
+        pending_before = store.pending_edges()
+        self.assertEqual(len(pending_before), 1)
+        result = store.revoke_edge(first_id, decided_by="reviewer")
+        self.assertEqual(
+            [e["id"] for e in result["affected_pending"]], [third["edge_id"]],
+        )
+        revoked = store.edge_dict(store._edge_row(first_id))
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(revoked["note"], "approved basis")
+        rejected = store.edge_dict(store._edge_row(second_id))
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["reject_reason"], "not adopted: versions diverge")
+        history = store.project_history("demo")
+        self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in history))
+        report = store.project_report("demo")
+        self.assertEqual(len(report["components"]), 3)
