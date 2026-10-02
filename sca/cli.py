@@ -71,6 +71,50 @@ def _print_preview(preview: dict) -> None:
         print(f"  existing edge: {preview['existing_edge']['origin']} / {preview['existing_edge']['status']}")
 
 
+def _print_decision(decision: dict) -> None:
+    sources = ", ".join(decision["sources"])
+    print(
+        f"decision #{decision['id']} [{decision['status']}] "
+        f"{decision['from_purl']} <-> {decision['to_purl']} "
+        f"ecosystem={decision['ecosystem']} versions={decision['version_range']} sources={sources}"
+    )
+    if decision.get("note"):
+        print(f"  note: {decision['note']}")
+
+
+def _print_joint_preview(preview: dict) -> None:
+    print(f"joint preview of {len(preview['candidates'])} pending decision(s):")
+    for candidate in preview["candidates"]:
+        sources = ", ".join(candidate["sources"])
+        print(
+            f"  candidate #{candidate['id']}: {candidate['from']} <-> {candidate['to']} "
+            f"versions={candidate['version_range']} sources={sources}"
+        )
+    for merge in preview["merges"]:
+        project = merge["project"]
+        print(
+            f"  [MERGE] {project['name']} {project['version']}: "
+            f"{', '.join(merge['components'])} versions={', '.join(merge['versions'])}"
+        )
+    for conflict in preview["conflicts"]:
+        project = conflict["project"]
+        print(
+            f"  [CONFLICT] {project['name']} {project['version']}: "
+            f"versions {', '.join(conflict['versions'])} chained via:"
+        )
+        for link in conflict["via_decisions"]:
+            print(f"    decision #{link['id']} [{link['status']}]: {link['from']} <-> {link['to']}")
+        for path in conflict["evidence_paths"]:
+            print(
+                f"    evidence: {path['purl']} {path['version']} "
+                f"@ {path['source_path']} :: {path['location_path']}"
+            )
+    for warning in preview["warnings"]:
+        print(f"  [WARNING] {warning}")
+    if not preview["merges"] and not preview["conflicts"]:
+        print("  no project affected")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Offline dependency evidence aggregation")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -87,17 +131,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     alias_parser = subparsers.add_parser("alias", help="review, approve or revoke component aliases")
     alias_subparsers = alias_parser.add_subparsers(dest="alias_command", required=True)
-    for alias_command in ("propose", "preview", "approve", "revoke"):
+    for alias_command in ("preview", "approve", "revoke"):
         command_parser = alias_subparsers.add_parser(alias_command)
         command_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
         command_parser.add_argument("--from", dest="from_ref", required=True)
         command_parser.add_argument("--to", dest="to_ref", required=True)
         command_parser.add_argument("--by", default="operator")
         command_parser.add_argument("--json", action="store_true")
+    propose_parser = alias_subparsers.add_parser("propose")
+    propose_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    propose_parser.add_argument("--from", dest="from_ref", required=True)
+    propose_parser.add_argument("--to", dest="to_ref", required=True)
+    propose_parser.add_argument("--by", default="operator")
+    propose_parser.add_argument("--versions", default="*", help="version range scope, e.g. '>=1.0,<2.0'")
+    propose_parser.add_argument("--source", action="append", default=[], help="limit to a manifest source path; repeatable")
+    propose_parser.add_argument("--json", action="store_true")
     list_parser = alias_subparsers.add_parser("list")
     list_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
     list_parser.add_argument("--status", choices=("pending", "approved", "revoked", "all"), default="all")
     list_parser.add_argument("--json", action="store_true")
+    decisions_parser = alias_subparsers.add_parser("decisions", help="list scoped alias decisions")
+    decisions_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    decisions_parser.add_argument(
+        "--status", choices=("pending", "approved", "withdrawn", "rejected", "all"), default="all"
+    )
+    decisions_parser.add_argument("--json", action="store_true")
+    joint_parser = alias_subparsers.add_parser("joint-preview", help="preview pending decisions together")
+    joint_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    joint_parser.add_argument("--id", type=int, action="append", default=[], help="limit to specific pending decision ids")
+    joint_parser.add_argument("--json", action="store_true")
+    adopt_parser = alias_subparsers.add_parser("adopt", help="approve a subset of pending decisions")
+    adopt_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    adopt_parser.add_argument("--id", type=int, action="append", required=True)
+    adopt_parser.add_argument("--by", default="operator")
+    adopt_parser.add_argument("--json", action="store_true")
+    reject_parser = alias_subparsers.add_parser("reject", help="mark a pending decision as not adopted")
+    reject_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    reject_parser.add_argument("--id", type=int, required=True)
+    reject_parser.add_argument("--reason", required=True)
+    reject_parser.add_argument("--by", default="operator")
+    reject_parser.add_argument("--json", action="store_true")
+    withdraw_parser = alias_subparsers.add_parser("withdraw", help="withdraw an adopted decision")
+    withdraw_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    withdraw_parser.add_argument("--id", type=int, required=True)
+    withdraw_parser.add_argument("--by", default="operator")
+    withdraw_parser.add_argument("--json", action="store_true")
 
     history_parser = subparsers.add_parser("history", help="list stored scan conclusion snapshots")
     history_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
@@ -142,12 +220,59 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     _print_preview(preview)
             elif args.alias_command == "propose":
-                result = store.propose_alias(args.from_ref, args.to_ref, created_by=args.by)
+                result = store.propose_decision(
+                    args.from_ref,
+                    args.to_ref,
+                    version_range=args.versions,
+                    sources=args.source or None,
+                    created_by=args.by,
+                )
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
                 else:
-                    print(f"proposed edge #{result['edge_id']} [{result['status']}]")
+                    _print_decision(result["decision"])
                     _print_preview(result["preview"])
+            elif args.alias_command == "decisions":
+                status = None if args.status == "all" else args.status
+                decisions = store.list_decisions(status=status)
+                if args.json:
+                    print(json.dumps(decisions, ensure_ascii=False, indent=2, default=str))
+                else:
+                    for decision in decisions:
+                        _print_decision(decision)
+            elif args.alias_command == "joint-preview":
+                preview = store.joint_preview(args.id or None)
+                if args.json:
+                    print(json.dumps(preview, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_joint_preview(preview)
+            elif args.alias_command == "adopt":
+                result = store.adopt_decisions(args.id, decided_by=args.by)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                else:
+                    for decision in result["adopted"]:
+                        _print_decision(decision)
+                    print(f"refreshed projects: {result['refreshed_projects']}")
+                    for item in result["repreviewed"]:
+                        print(f"re-previewed pending decision #{item['decision']['id']}:")
+                        _print_joint_preview(item["preview"])
+            elif args.alias_command == "reject":
+                decision = store.reject_decision(args.id, reason=args.reason, decided_by=args.by)
+                if args.json:
+                    print(json.dumps(decision, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_decision(decision)
+            elif args.alias_command == "withdraw":
+                result = store.withdraw_decision(args.id, decided_by=args.by)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_decision(result["withdrawn"])
+                    print(f"refreshed projects: {result['refreshed_projects']}")
+                    for item in result["rechecked"]:
+                        print(f"re-checked dependent decision #{item['decision']['id']}:")
+                        _print_joint_preview(item["preview"])
             elif args.alias_command == "approve":
                 result = store.approve_alias(args.from_ref, args.to_ref, decided_by=args.by)
                 if args.json:

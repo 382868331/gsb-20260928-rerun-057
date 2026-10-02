@@ -1,5 +1,12 @@
 # Scoped Manual Aliasing for Software Composition Analysis
 
+> Note: this directory is the original standalone prototype (JSONL event
+> log, runnable only from inside sca/). The scoped-alias capability is now
+> integrated into the main package at the repository root — same CLI entry
+> point and SQLite database as import / report / history, plus joint
+> preview of pending proposals, partial adoption with re-preview, and
+> withdrawal re-checks. See the root README and tests/test_scoped_decisions.py.
+
 Manual alias decisions are constrained to an explicit **ecosystem**,
 **version range**, and **source scope**. Confirming that two names are
 equivalent in one project never merges them in other projects or in

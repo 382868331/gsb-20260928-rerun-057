@@ -44,6 +44,33 @@ python -m sca.cli alias approve --db /tmp/sca.sqlite3 \
 python -m sca.cli history --db /tmp/sca.sqlite3 --project shopstack
 ```
 
+## 受限别名决策（与导入、报告、历史同一入口）
+
+人工别名提案可以携带显式作用域：生态系统、版本范围和来源清单路径。决策只在其作用域内生效，
+不会扩散到其他项目或来源；所有提案、批准、撤回都写入同一个 SQLite 数据库，
+report 与 history 立即可见，无需切换入口或存储。
+
+```bash
+# 带作用域的提案（--source 可重复；默认 versions=*、来源=*）
+python -m sca.cli alias propose --db /tmp/sca.sqlite3 \
+  --from maven:com.a:core --to maven:com.b:core \
+  --versions ">=1.0.0,<2.0.0" --source samples/services.maven-tree.json
+# 查看所有受限决策及其状态
+python -m sca.cli alias decisions --db /tmp/sca.sqlite3
+# 多份待批准提案的联合预览：组合后若把不兼容版本连在一起，
+# 会列出冲突经过的提案与原始证据路径（来源清单 :: 构建路径）
+python -m sca.cli alias joint-preview --db /tmp/sca.sqlite3
+# 只采纳其中一部分；剩余提案按新的已确认范围重新预览，作用域不会被扩大
+python -m sca.cli alias adopt --db /tmp/sca.sqlite3 --id 1 --id 3
+# 记录未采用原因
+python -m sca.cli alias reject --db /tmp/sca.sqlite3 --id 2 --reason "两个组件身份不同"
+# 撤回已采纳提案：重新核对相关待批准提案；批准时的依据与未采用原因保留
+python -m sca.cli alias withdraw --db /tmp/sca.sqlite3 --id 1
+```
+
+说明：嵌套的 sca/sca/ 目录是最初的独立原型（JSONL 事件日志），其能力已整合进上述主包；
+保留原样仅供对照，新工作请使用仓库根目录的 python -m sca.cli。
+
 重复导入同一内容不会新增证据：来源内容使用 SHA-256 去重，单条记录还有独立的规范化哈希（包含生态、规范身份、版本与构建路径）。导入同一路径的更新内容时，会作为项目的新来源版本保留；导入不同路径但内容完全相同的副本、以及同一路径的重复导入都不会产生重复证据。组件去重通过规范身份在全库范围内追溯，跨构建路径出现的同一组件只归并身份、不合并证据。
 
 ## 测试

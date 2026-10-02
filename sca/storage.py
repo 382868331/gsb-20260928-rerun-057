@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from .identity import component_key, identify
 from .models import DependencyEvidence, ParsedManifest
+from .versioning import in_range
 
 
 SCHEMA = """
@@ -83,6 +84,21 @@ CREATE TABLE IF NOT EXISTS project_components (
     status TEXT NOT NULL CHECK(status IN ('unified', 'conflict')),
     evidence_count INTEGER NOT NULL,
     PRIMARY KEY(project_id, component_id)
+);
+
+CREATE TABLE IF NOT EXISTS alias_decisions (
+    id INTEGER PRIMARY KEY,
+    edge_id INTEGER NOT NULL REFERENCES alias_edges(id),
+    ecosystem TEXT NOT NULL,
+    version_range TEXT NOT NULL DEFAULT '*',
+    sources_json TEXT NOT NULL DEFAULT '["*"]',
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'withdrawn', 'rejected')),
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    decided_at TEXT,
+    decided_by TEXT,
+    basis_json TEXT,
+    note TEXT
 );
 """
 
@@ -285,7 +301,93 @@ class Store:
         ).fetchall()
         return [(int(row[0]), int(row[1])) for row in rows]
 
-    def alias_groups(self) -> dict[int, int]:
+    def _unscoped_approved_edges(self) -> list[tuple[int, int]]:
+        """Approved edges not governed by an approved scoped decision."""
+        rows = self.conn.execute(
+            """
+            SELECT e.from_component_id, e.to_component_id FROM alias_edges e
+            WHERE e.status='approved' AND NOT EXISTS (
+                SELECT 1 FROM alias_decisions d WHERE d.edge_id=e.id AND d.status='approved'
+            )
+            """
+        ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
+    @staticmethod
+    def _decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "edge_id": int(row["edge_id"]),
+            "ecosystem": row["ecosystem"],
+            "version_range": row["version_range"],
+            "sources": json.loads(row["sources_json"]),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "created_by": row["created_by"],
+            "decided_at": row["decided_at"],
+            "decided_by": row["decided_by"],
+            "basis": json.loads(row["basis_json"]) if row["basis_json"] else None,
+            "note": row["note"],
+            "from_component_id": int(row["from_component_id"]),
+            "to_component_id": int(row["to_component_id"]),
+            "from_ref": f"{row['from_ecosystem']}:{row['from_name']}",
+            "to_ref": f"{row['to_ecosystem']}:{row['to_name']}",
+            "from_purl": row["from_purl"],
+            "to_purl": row["to_purl"],
+        }
+
+    _DECISION_SELECT = """
+        SELECT d.*, e.from_component_id, e.to_component_id,
+               c1.ecosystem AS from_ecosystem, c1.canonical_name AS from_name, c1.purl AS from_purl,
+               c2.ecosystem AS to_ecosystem, c2.canonical_name AS to_name, c2.purl AS to_purl
+        FROM alias_decisions d
+        JOIN alias_edges e ON e.id=d.edge_id
+        JOIN components c1 ON c1.id=e.from_component_id
+        JOIN components c2 ON c2.id=e.to_component_id
+    """
+
+    def list_decisions(self, status: str | None = None) -> list[dict[str, Any]]:
+        sql = self._DECISION_SELECT
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " WHERE d.status=?"
+            params = (status,)
+        sql += " ORDER BY d.id"
+        return [self._decision_from_row(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def get_decision(self, decision_id: int) -> dict[str, Any]:
+        row = self.conn.execute(self._DECISION_SELECT + " WHERE d.id=?", (decision_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"alias decision not found: {decision_id}")
+        return self._decision_from_row(row)
+
+    def _side_in_scope(
+        self, project_id: int, component_id: int, version_range: str, sources: list[str]
+    ) -> bool:
+        rows = self.conn.execute(
+            """
+            SELECT e.version, s.source_path FROM dependency_evidence e
+            JOIN manifest_sources s ON s.id=e.source_id
+            WHERE e.project_id=? AND e.component_id=?
+            """,
+            (project_id, component_id),
+        ).fetchall()
+        for row in rows:
+            if sources != ["*"] and row["source_path"] not in sources:
+                continue
+            if in_range(row["version"], version_range):
+                return True
+        return False
+
+    def decision_applies(self, project_id: int, decision: dict[str, Any]) -> bool:
+        """A scoped decision only merges where both sides have in-scope evidence."""
+        return self._side_in_scope(
+            project_id, decision["from_component_id"], decision["version_range"], decision["sources"]
+        ) and self._side_in_scope(
+            project_id, decision["to_component_id"], decision["version_range"], decision["sources"]
+        )
+
+    def _groups_for(self, project_id: int | None, extra_decisions: list[dict[str, Any]] | None = None) -> dict[int, int]:
         parent: dict[int, int] = {}
 
         def find(value: int) -> int:
@@ -300,10 +402,18 @@ class Store:
             if left_root != right_root:
                 parent[max(left_root, right_root)] = min(left_root, right_root)
 
-        for left, right in self._approved_edges(self.conn.cursor()):
+        for left, right in self._unscoped_approved_edges():
             union(left, right)
+        scoped = self.list_decisions(status="approved") + list(extra_decisions or [])
+        if project_id is not None:
+            for decision in scoped:
+                if self.decision_applies(project_id, decision):
+                    union(decision["from_component_id"], decision["to_component_id"])
         groups = {component_id: find(component_id) for component_id in parent}
         return groups
+
+    def alias_groups(self, project_id: int | None = None) -> dict[int, int]:
+        return self._groups_for(project_id)
 
     def alias_preview(self, first_ref: str, second_ref: str) -> dict[str, Any]:
         first = self.resolve_component(first_ref)
@@ -412,9 +522,33 @@ class Store:
         return {"revoked_edge": int(row["id"]), "refreshed_projects": affected}
 
     def _edge_component_group(self, component_id: int) -> set[int]:
-        groups = self.alias_groups()
+        groups = self._groups_with_all_approved_decisions()
         root = groups.get(component_id, component_id)
         return {item for item, group_root in groups.items() if group_root == root} | {root, component_id}
+
+    def _groups_with_all_approved_decisions(self) -> dict[int, int]:
+        """Global connectivity including every approved scoped decision,
+        regardless of per-project scope. Used to find related components
+        when withdrawing or revoking."""
+        parent: dict[int, int] = {}
+
+        def find(value: int) -> int:
+            parent.setdefault(value, value)
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = parent[value]
+            return value
+
+        for left, right in self._unscoped_approved_edges():
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[max(left_root, right_root)] = min(left_root, right_root)
+        for decision in self.list_decisions(status="approved"):
+            left_root = find(decision["from_component_id"])
+            right_root = find(decision["to_component_id"])
+            if left_root != right_root:
+                parent[max(left_root, right_root)] = min(left_root, right_root)
+        return {component_id: find(component_id) for component_id in parent}
 
     def _refresh_affected_projects(self, component_ids: set[int], *, reason: str = "alias-approve") -> list[int]:
         if not component_ids:
@@ -431,13 +565,15 @@ class Store:
         return project_ids
 
     def refresh_project_components(self, project_id: int | None = None) -> None:
-        groups = self.alias_groups()
+        if project_id is None:
+            project_ids = [int(row[0]) for row in self.conn.execute("SELECT id FROM projects").fetchall()]
+            for pid in project_ids:
+                self.refresh_project_components(pid)
+            return
+        groups = self.alias_groups(project_id=project_id)
         where = "WHERE e.project_id=?" if project_id is not None else ""
         params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
-        if project_id is not None:
-            self.conn.execute("DELETE FROM project_components WHERE project_id=?", (project_id,))
-        else:
-            self.conn.execute("DELETE FROM project_components")
+        self.conn.execute("DELETE FROM project_components WHERE project_id=?", (project_id,))
         rows = self.conn.execute(
             f"""
             SELECT e.project_id, e.component_id, e.version
@@ -485,7 +621,7 @@ class Store:
         ).fetchone()
         if project is None:
             raise KeyError(f"project not found: {project_name}")
-        groups = self.alias_groups()
+        groups = self.alias_groups(project_id=int(project["id"]))
         component_rows = self.conn.execute("SELECT * FROM components").fetchall()
         members: dict[int, list[dict[str, Any]]] = {}
         for row in component_rows:
@@ -592,3 +728,281 @@ class Store:
             """
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # ---- scoped alias decisions --------------------------------------
+
+    def propose_decision(
+        self,
+        first_ref: str,
+        second_ref: str,
+        *,
+        version_range: str = "*",
+        sources: Iterable[str] | None = None,
+        created_by: str = "operator",
+    ) -> dict[str, Any]:
+        sources = list(sources) if sources else ["*"]
+        in_range("0.0.0", version_range)  # validate range syntax early
+        preview = self.alias_preview(first_ref, second_ref)
+        if not preview["allowed"]:
+            raise ValueError("; ".join(preview["reasons"]))
+        first_id, second_id = int(preview["from"]["id"]), int(preview["to"]["id"])
+        from_id, to_id = self._ordered(first_id, second_id)
+        cursor = self.conn.cursor()
+        edge_id = self._upsert_alias_edge(cursor, from_id, to_id, origin="manual", status="pending")
+        existing = self.conn.execute(
+            "SELECT id, status FROM alias_decisions WHERE edge_id=? AND status IN ('pending', 'approved')",
+            (edge_id,),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(f"decision already exists for this pair: #{existing[0]} [{existing[1]}]")
+        now = utc_now()
+        basis = {
+            "kind": "propose",
+            "preview": preview,
+            "version_range": version_range,
+            "sources": sources,
+        }
+        cursor.execute(
+            "INSERT INTO alias_decisions(edge_id, ecosystem, version_range, sources_json, status, "
+            "created_at, created_by, basis_json) VALUES(?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (
+                edge_id,
+                preview["from"]["ecosystem"],
+                version_range,
+                json.dumps(sources, ensure_ascii=False),
+                now,
+                created_by,
+                json.dumps(basis, ensure_ascii=False, sort_keys=True, default=str),
+            ),
+        )
+        self.conn.commit()
+        decision_id = int(cursor.lastrowid)
+        return {"decision": self.get_decision(decision_id), "preview": preview}
+
+    def _scoped_links(self, project_id: int, extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        links = []
+        for decision in self.list_decisions(status="approved") + list(extra):
+            if self.decision_applies(project_id, decision):
+                links.append(decision)
+        return links
+
+    def joint_preview(self, decision_ids: list[int] | None = None) -> dict[str, Any]:
+        """Preview several pending decisions as if all were approved together.
+
+        Each candidate keeps its own declared ecosystem / version range /
+        source scope; the simulation never widens any of them. Groups that
+        end up chaining incompatible versions are reported with the
+        proposals and the original evidence paths involved.
+        """
+        pending = {d["id"]: d for d in self.list_decisions(status="pending")}
+        if decision_ids:
+            missing = [i for i in decision_ids if i not in pending]
+            if missing:
+                raise KeyError(f"unknown or non-pending decision(s): {missing}")
+            candidates = [pending[i] for i in decision_ids]
+        else:
+            candidates = [pending[i] for i in sorted(pending)]
+        projects = self.conn.execute("SELECT id, name, version FROM projects ORDER BY id").fetchall()
+        merges: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        candidate_ids = {d["id"] for d in candidates}
+        for project in projects:
+            project_id = int(project["id"])
+            links = self._scoped_links(project_id, candidates)
+            if not any(link["id"] in candidate_ids for link in links):
+                continue
+            groups = self._groups_for(project_id, extra_decisions=candidates)
+            members: dict[int, set[int]] = {}
+            for component_id, root in groups.items():
+                members.setdefault(root, set()).add(component_id)
+            for root, component_ids in members.items():
+                if len(component_ids) < 2:
+                    continue
+                involved = [
+                    link
+                    for link in links
+                    if link["from_component_id"] in component_ids and link["to_component_id"] in component_ids
+                ]
+                if not any(link["id"] in candidate_ids for link in involved):
+                    continue
+                placeholders = ",".join("?" for _ in component_ids)
+                evidence_rows = self.conn.execute(
+                    f"""
+                    SELECT e.version, e.location_path, s.source_path, c.purl, c.canonical_name
+                    FROM dependency_evidence e
+                    JOIN manifest_sources s ON s.id=e.source_id
+                    JOIN components c ON c.id=e.component_id
+                    WHERE e.project_id=? AND e.component_id IN ({placeholders})
+                    ORDER BY c.canonical_name, e.version
+                    """,
+                    (project_id, *sorted(component_ids)),
+                ).fetchall()
+                evidence = [dict(row) for row in evidence_rows]
+                versions = sorted({row["version"] for row in evidence_rows if row["version"]})
+                entry = {
+                    "project": {"id": project_id, "name": project["name"], "version": project["version"]},
+                    "components": sorted({row["purl"] for row in evidence_rows}),
+                    "versions": versions,
+                    "via_decisions": [
+                        {
+                            "id": link["id"],
+                            "from": link["from_purl"],
+                            "to": link["to_purl"],
+                            "status": link["status"],
+                        }
+                        for link in involved
+                    ],
+                    "evidence_paths": [
+                        {
+                            "purl": row["purl"],
+                            "version": row["version"],
+                            "source_path": row["source_path"],
+                            "location_path": row["location_path"],
+                        }
+                        for row in evidence
+                    ],
+                }
+                if len(versions) > 1:
+                    conflicts.append(entry)
+                else:
+                    merges.append(entry)
+        warnings: list[str] = []
+        for candidate in candidates:
+            for project in projects:
+                project_id = int(project["id"])
+                for component_id in (candidate["from_component_id"], candidate["to_component_id"]):
+                    rows = self.conn.execute(
+                        """
+                        SELECT DISTINCT e.version, s.source_path FROM dependency_evidence e
+                        JOIN manifest_sources s ON s.id=e.source_id
+                        WHERE e.project_id=? AND e.component_id=?
+                        """,
+                        (project_id, component_id),
+                    ).fetchall()
+                    for row in rows:
+                        in_source_scope = candidate["sources"] == ["*"] or row["source_path"] in candidate["sources"]
+                        if in_source_scope and not in_range(row["version"], candidate["version_range"]):
+                            warnings.append(
+                                f"decision #{candidate['id']} declares range "
+                                f"'{candidate['version_range']}' but in-scope source "
+                                f"'{row['source_path']}' also carries version {row['version']} "
+                                f"(project {project['name']} {project['version']})"
+                            )
+        return {
+            "candidates": [
+                {
+                    "id": d["id"],
+                    "from": d["from_purl"],
+                    "to": d["to_purl"],
+                    "ecosystem": d["ecosystem"],
+                    "version_range": d["version_range"],
+                    "sources": d["sources"],
+                }
+                for d in candidates
+            ],
+            "merges": merges,
+            "conflicts": conflicts,
+            "warnings": sorted(set(warnings)),
+        }
+
+    def adopt_decisions(self, decision_ids: list[int], *, decided_by: str = "operator") -> dict[str, Any]:
+        """Approve a subset of pending decisions. Remaining pending decisions
+        are re-previewed against the newly confirmed state; their declared
+        ecosystem / version range / source scope is never widened."""
+        adopted: list[dict[str, Any]] = []
+        refreshed: set[int] = set()
+        for decision_id in decision_ids:
+            decision = self.get_decision(decision_id)
+            if decision["status"] != "pending":
+                raise ValueError(f"decision #{decision_id} is not pending (status={decision['status']})")
+            basis = self.joint_preview([decision_id])
+            basis["kind"] = "adopt"
+            now = utc_now()
+            self.conn.execute(
+                "UPDATE alias_decisions SET status='approved', decided_at=?, decided_by=?, basis_json=? WHERE id=?",
+                (now, decided_by, json.dumps(basis, ensure_ascii=False, sort_keys=True, default=str), decision_id),
+            )
+            self.conn.execute(
+                "UPDATE alias_edges SET status='approved', decided_at=?, decided_by=? WHERE id=?",
+                (now, decided_by, decision["edge_id"]),
+            )
+            self.conn.commit()
+            refreshed.update(
+                self._refresh_affected_projects(
+                    {decision["from_component_id"], decision["to_component_id"]}, reason="decision-adopt"
+                )
+            )
+            adopted.append(self.get_decision(decision_id))
+        repreviewed = []
+        for remaining in self.list_decisions(status="pending"):
+            preview = self.joint_preview([remaining["id"]])
+            preview["kind"] = "re-preview"
+            self.conn.execute(
+                "UPDATE alias_decisions SET basis_json=? WHERE id=?",
+                (json.dumps(preview, ensure_ascii=False, sort_keys=True, default=str), remaining["id"]),
+            )
+            self.conn.commit()
+            repreviewed.append({"decision": self.get_decision(remaining["id"]), "preview": preview})
+        return {
+            "adopted": adopted,
+            "repreviewed": repreviewed,
+            "refreshed_projects": sorted(refreshed),
+        }
+
+    def reject_decision(self, decision_id: int, *, reason: str, decided_by: str = "operator") -> dict[str, Any]:
+        decision = self.get_decision(decision_id)
+        if decision["status"] != "pending":
+            raise ValueError(f"decision #{decision_id} is not pending (status={decision['status']})")
+        now = utc_now()
+        self.conn.execute(
+            "UPDATE alias_decisions SET status='rejected', decided_at=?, decided_by=?, note=? WHERE id=?",
+            (now, decided_by, reason, decision_id),
+        )
+        self.conn.execute(
+            "UPDATE alias_edges SET status='revoked', decided_at=?, decided_by=? WHERE id=?",
+            (now, decided_by, decision["edge_id"]),
+        )
+        self.conn.commit()
+        return self.get_decision(decision_id)
+
+    def withdraw_decision(self, decision_id: int, *, decided_by: str = "operator") -> dict[str, Any]:
+        """Withdraw an adopted decision. The approval basis recorded earlier
+        (basis_json) and any rejection notes are kept; dependent pending
+        proposals are re-checked against the re-derived groups."""
+        decision = self.get_decision(decision_id)
+        if decision["status"] != "approved":
+            raise ValueError(f"decision #{decision_id} is not approved (status={decision['status']})")
+        affected_components = self._edge_component_group(decision["from_component_id"]) | self._edge_component_group(
+            decision["to_component_id"]
+        )
+        now = utc_now()
+        self.conn.execute(
+            "UPDATE alias_decisions SET status='withdrawn', decided_at=?, decided_by=? WHERE id=?",
+            (now, decided_by, decision_id),
+        )
+        self.conn.execute(
+            "UPDATE alias_edges SET status='revoked', decided_at=?, decided_by=? WHERE id=?",
+            (now, decided_by, decision["edge_id"]),
+        )
+        self.conn.commit()
+        refreshed = self._refresh_affected_projects(affected_components, reason="decision-withdraw")
+        rechecked = []
+        for pending in self.list_decisions(status="pending"):
+            related = (
+                {pending["from_component_id"], pending["to_component_id"]} & affected_components
+            )
+            if not related:
+                continue
+            preview = self.joint_preview([pending["id"]])
+            preview["kind"] = "withdraw-recheck"
+            self.conn.execute(
+                "UPDATE alias_decisions SET basis_json=? WHERE id=?",
+                (json.dumps(preview, ensure_ascii=False, sort_keys=True, default=str), pending["id"]),
+            )
+            self.conn.commit()
+            rechecked.append({"decision": self.get_decision(pending["id"]), "preview": preview})
+        return {
+            "withdrawn": self.get_decision(decision_id),
+            "rechecked": rechecked,
+            "refreshed_projects": refreshed,
+        }
