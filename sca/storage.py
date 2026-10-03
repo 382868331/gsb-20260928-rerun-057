@@ -53,9 +53,35 @@ CREATE TABLE IF NOT EXISTS alias_edges (
     decided_by TEXT,
     version_range TEXT NOT NULL DEFAULT '*',
     sources_json TEXT NOT NULL DEFAULT '["*"]',
+    project_versions_json TEXT,
     note TEXT,
     reject_reason TEXT,
     UNIQUE(from_component_id, to_component_id)
+);
+
+CREATE TABLE IF NOT EXISTS inheritance_plans (
+    id INTEGER PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    from_version TEXT NOT NULL,
+    to_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT,
+    UNIQUE(project_name, to_version)
+);
+
+CREATE TABLE IF NOT EXISTS inheritance_items (
+    id INTEGER PRIMARY KEY,
+    plan_id INTEGER NOT NULL REFERENCES inheritance_plans(id),
+    source_edge_id INTEGER REFERENCES alias_edges(id),
+    inherited_edge_id INTEGER REFERENCES alias_edges(id),
+    classification TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'inherited', 'narrowed', 'skipped', 'new')),
+    detail_json TEXT NOT NULL,
+    signature_json TEXT,
+    decided_at TEXT,
+    decided_by TEXT,
+    note TEXT,
+    UNIQUE(plan_id, source_edge_id)
 );
 
 CREATE TABLE IF NOT EXISTS project_snapshots (
@@ -115,6 +141,9 @@ class Store:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='alias_edges'"
         ).fetchone()[0]
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(alias_edges)")}
+        if "project_versions_json" not in columns:
+            self.conn.execute("ALTER TABLE alias_edges ADD COLUMN project_versions_json TEXT")
+            self.conn.commit()
         needed = {"version_range", "sources_json", "note", "reject_reason"}
         if needed <= columns and "'rejected'" in table_sql:
             return
@@ -325,6 +354,10 @@ class Store:
             "SELECT * FROM alias_edges WHERE status='approved' ORDER BY id"
         ).fetchall()
 
+    def _project_version(self, project_id: int) -> str:
+        row = self.conn.execute("SELECT version FROM projects WHERE id=?", (project_id,)).fetchone()
+        return row["version"] if row is not None else ""
+
     @staticmethod
     def _edge_sources(edge: sqlite3.Row) -> list[str]:
         try:
@@ -333,9 +366,58 @@ class Store:
             sources = ["*"]
         return sources or ["*"]
 
-    def _edge_applies_to_project(self, edge: sqlite3.Row, project_name: str) -> bool:
+    def _edge_project_scope(
+        self, edge: sqlite3.Row | dict, project_name: str
+    ) -> dict[str, Any] | None:
+        keys = tuple(edge.keys())
+        raw = edge["project_versions_json"] if "project_versions_json" in keys else None
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        scope: dict[str, Any]
+        if isinstance(data, list):
+            scope = {"versions": list(data)}
+        if isinstance(data, dict):
+            entry = data.get(project_name, data.get("*"))
+            if entry is None:
+                return {"versions": None, "range": "*", "source_paths": None}
+            if isinstance(entry, list):
+                scope = {"versions": list(entry)}
+            elif isinstance(entry, dict):
+                scope = {
+                    "versions": entry.get("versions"),
+                    "range": entry.get("range", "*"),
+                    "source_paths": entry.get("source_paths"),
+                }
+            else:
+                return None
+        versions = scope.get("versions")
+        return {
+            "versions": [str(item) for item in versions] if versions is not None else None,
+            "range": str(scope.get("range") or "*"),
+            "source_paths": (
+                [str(item) for item in scope["source_paths"]]
+                if scope.get("source_paths") is not None
+                else None
+            ),
+        }
+        return None
+
+    def _edge_applies_to_project(
+        self, edge: sqlite3.Row | dict, project_name: str, project_version: str | None = None
+    ) -> bool:
         sources = self._edge_sources(edge)
-        return sources == ["*"] or project_name in sources
+        if sources != ["*"] and project_name not in sources:
+            return False
+        scope = self._edge_project_scope(edge, project_name)
+        if scope is None:
+            return True
+        if project_version is not None and scope["versions"] is not None and project_version not in scope["versions"]:
+            return False
+        return True
 
     def _component_versions_in_project(self, component_id: int, project_id: int) -> list[str]:
         rows = self.conn.execute(
@@ -345,7 +427,7 @@ class Store:
         return [row[0] for row in rows if row[0]]
 
     def _compute_groups(
-        self, edges: list[sqlite3.Row], project: tuple[int, str] | None = None
+        self, edges: list[sqlite3.Row | dict], project: tuple[int, str, str] | None = None
     ) -> dict[int, int]:
         parent: dict[int, int] = {}
 
@@ -364,10 +446,11 @@ class Store:
         for edge in edges:
             from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
             if project is not None:
-                project_id, project_name = project
-                if not self._edge_applies_to_project(edge, project_name):
+                project_id, project_name, project_version = project
+                if not self._edge_applies_to_project(edge, project_name, project_version):
                     continue
-                version_range = edge["version_range"] or "*"
+                project_scope = self._edge_project_scope(edge, project_name) or {}
+                version_range = project_scope.get("range") or edge["version_range"] or "*"
                 from_versions = self._component_versions_in_project(from_id, project_id)
                 to_versions = self._component_versions_in_project(to_id, project_id)
                 if not any(in_range(version, version_range) for version in from_versions):
@@ -381,11 +464,69 @@ class Store:
         project = None
         if project_id is not None:
             row = self.conn.execute(
-                "SELECT id, name FROM projects WHERE id=?", (project_id,)
+                "SELECT id, name, version FROM projects WHERE id=?", (project_id,)
             ).fetchone()
             if row is not None:
-                project = (int(row["id"]), row["name"])
+                project = (int(row["id"]), row["name"], row["version"])
         return self._compute_groups(self._approved_edge_rows(), project)
+
+    def _evidence_rows(self, project_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT e.id AS evidence_id, e.component_id, e.version, e.location_path, s.source_path "
+            "FROM dependency_evidence e JOIN manifest_sources s ON s.id=e.source_id "
+            "WHERE e.project_id=? ORDER BY e.id",
+            (project_id,),
+        ).fetchall()
+
+    def logical_groups(self, project_id: int) -> dict[int, int]:
+        """Map every evidence row id to its logical component root for one project."""
+        project = self.conn.execute("SELECT id, name, version FROM projects WHERE id=?", (project_id,)).fetchone()
+        if project is None:
+            return {}
+        project_name, project_version = project["name"], project["version"]
+        rows = self._evidence_rows(project_id)
+        parent: dict[int, int] = {}
+
+        def find(value: int) -> int:
+            parent.setdefault(value, value)
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = parent[value]
+            return value
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[max(left_root, right_root)] = min(left_root, right_root)
+
+        by_component: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            component_id = int(row["component_id"])
+            by_component.setdefault(component_id, []).append(row)
+            find(component_id)
+        for edge in self._approved_edge_rows():
+            if not self._edge_applies_to_project(edge, project_name, project_version):
+                continue
+            scope = self._edge_project_scope(edge, project_name) or {}
+            version_range = scope.get("range") or edge["version_range"] or "*"
+            allowed_paths = scope.get("source_paths")
+            matched: list[int] = []
+            for endpoint_key in ("from_component_id", "to_component_id"):
+                endpoint_matches = []
+                for evidence in by_component.get(int(edge[endpoint_key]), []):
+                    if allowed_paths is not None and evidence["source_path"] not in allowed_paths:
+                        continue
+                    if evidence["version"] and not in_range(evidence["version"], version_range):
+                        continue
+                    endpoint_matches.append(int(evidence["evidence_id"]))
+                if not endpoint_matches:
+                    matched = []
+                    break
+                matched.extend(endpoint_matches)
+            for evidence_id in matched:
+                union(evidence_id, int(edge["from_component_id"]))
+                union(evidence_id, int(edge["to_component_id"]))
+        return {int(row["evidence_id"]): find(int(row["evidence_id"])) for row in rows}
 
     def alias_preview(
         self,
@@ -417,6 +558,7 @@ class Store:
             "to_component_id": second_id,
             "version_range": version_range or "*",
             "sources_json": json.dumps(scope_sources),
+            "project_versions_json": None,
         }
         simulated = list(self._approved_edge_rows()) + [candidate]
         project_rows = self.conn.execute(
@@ -430,7 +572,7 @@ class Store:
         for project_row in project_rows:
             project_id, project_name = int(project_row["id"]), project_row["name"]
             in_scope = self._edge_applies_to_project(candidate, project_name)
-            groups = self._compute_groups(simulated, (project_id, project_name))
+            groups = self._compute_groups(simulated, (project_id, project_name, self._project_version(project_id)))
             root = groups.get(first_id, first_id)
             merged = in_scope and root == groups.get(second_id, second_id)
             group_ids = {
@@ -694,7 +836,7 @@ class Store:
             ).fetchall()
             for project_row in project_rows:
                 project_id, project_name = int(project_row["id"]), project_row["name"]
-                groups = self._compute_groups(simulated, (project_id, project_name))
+                groups = self._compute_groups(simulated, (project_id, project_name, self._project_version(project_id)))
                 evidence_rows = self.conn.execute(
                     "SELECT e.component_id, e.version, e.location_path, s.source_path, c.canonical_name "
                     "FROM dependency_evidence e "
@@ -818,46 +960,39 @@ class Store:
         return project_ids
 
     def refresh_project_components(self, project_id: int | None = None) -> None:
-        groups = self.alias_groups(project_id)
-        where = "WHERE e.project_id=?" if project_id is not None else ""
-        params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
         if project_id is not None:
+            target_ids = [project_id]
             self.conn.execute("DELETE FROM project_components WHERE project_id=?", (project_id,))
         else:
+            target_ids = [int(row[0]) for row in self.conn.execute("SELECT id FROM projects").fetchall()]
             self.conn.execute("DELETE FROM project_components")
-        rows = self.conn.execute(
-            f"""
-            SELECT e.project_id, e.component_id, e.version
-            FROM dependency_evidence e
-            {where}
-            """,
-            params,
-        ).fetchall()
-        aggregated: dict[tuple[int, int], dict[str, Any]] = {}
-        for row in rows:
-            raw_component_id = int(row["component_id"])
-            root_id = groups.get(raw_component_id, raw_component_id)
-            bucket = aggregated.setdefault(
-                (int(row["project_id"]), root_id),
-                {"versions": set(), "evidence_count": 0},
-            )
-            if row["version"]:
-                bucket["versions"].add(row["version"])
-            bucket["evidence_count"] += 1
-        for ((project_value, root_id), bucket) in aggregated.items():
-            versions = sorted(bucket["versions"])
-            self.conn.execute(
-                "INSERT INTO project_components(project_id, component_id, versions_json, status, evidence_count) "
-                "VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id, component_id) DO UPDATE SET "
-                "versions_json=excluded.versions_json, status=excluded.status, evidence_count=excluded.evidence_count",
-                (
-                    project_value,
-                    root_id,
-                    json.dumps(versions, ensure_ascii=False),
-                    "conflict" if len(versions) > 1 else "unified",
-                    bucket["evidence_count"],
-                ),
-            )
+        for target_id in target_ids:
+            groups = self.logical_groups(target_id)
+            rows = self.conn.execute(
+                "SELECT id, component_id, version FROM dependency_evidence WHERE project_id=?",
+                (target_id,),
+            ).fetchall()
+            aggregated: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                root_id = groups[int(row["id"])]
+                bucket = aggregated.setdefault(root_id, {"versions": set(), "evidence_count": 0})
+                if row["version"]:
+                    bucket["versions"].add(row["version"])
+                bucket["evidence_count"] += 1
+            for root_id, bucket in aggregated.items():
+                versions = sorted(bucket["versions"])
+                self.conn.execute(
+                    "INSERT INTO project_components(project_id, component_id, versions_json, status, evidence_count) "
+                    "VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id, component_id) DO UPDATE SET "
+                    "versions_json=excluded.versions_json, status=excluded.status, evidence_count=excluded.evidence_count",
+                    (
+                        target_id,
+                        root_id,
+                        json.dumps(versions, ensure_ascii=False),
+                        "conflict" if len(versions) > 1 else "unified",
+                        bucket["evidence_count"],
+                    ),
+                )
         self.conn.commit()
 
     def project_report(self, project_name: str, project_version: str | None = None) -> dict[str, Any]:
