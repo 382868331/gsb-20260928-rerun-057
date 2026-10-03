@@ -89,6 +89,34 @@ CREATE TABLE IF NOT EXISTS project_components (
     evidence_count INTEGER NOT NULL,
     PRIMARY KEY(project_id, component_id)
 );
+
+CREATE TABLE IF NOT EXISTS inheritance_reviews (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    old_project_id INTEGER REFERENCES projects(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id)
+);
+
+CREATE TABLE IF NOT EXISTS inheritance_decisions (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL REFERENCES inheritance_reviews(id),
+    edge_id INTEGER NOT NULL REFERENCES alias_edges(id),
+    status TEXT NOT NULL CHECK(status IN ('proposed', 'kept', 'narrowed', 'dropped')),
+    classification TEXT NOT NULL
+        CHECK(classification IN ('same_identity', 'reconfirm', 'partial', 'disconnected', 'absent')),
+    old_versions_json TEXT NOT NULL DEFAULT '[]',
+    new_versions_json TEXT NOT NULL DEFAULT '[]',
+    applicable_source_paths_json TEXT NOT NULL DEFAULT '[]',
+    proposed_version_range TEXT,
+    proposed_sources_json TEXT,
+    proposed_source_paths_json TEXT,
+    rationale TEXT,
+    decided_at TEXT,
+    decided_by TEXT,
+    reopen_reason TEXT,
+    UNIQUE(review_id, edge_id)
+);
 """
 
 
@@ -337,12 +365,89 @@ class Store:
         sources = self._edge_sources(edge)
         return sources == ["*"] or project_name in sources
 
-    def _component_versions_in_project(self, component_id: int, project_id: int) -> list[str]:
+    def _project_evidence_index(self, project_id: int) -> dict[int, list[sqlite3.Row]]:
         rows = self.conn.execute(
-            "SELECT DISTINCT version FROM dependency_evidence WHERE component_id=? AND project_id=?",
-            (component_id, project_id),
+            "SELECT component_id, version, source_id FROM dependency_evidence WHERE project_id=?",
+            (project_id,),
         ).fetchall()
-        return [row[0] for row in rows if row[0]]
+        index: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            index.setdefault(int(row["component_id"]), []).append(row)
+        return index
+
+    def _active_inheritance_decisions(self, project_id: int) -> dict[int, sqlite3.Row]:
+        """Latest decision per approved edge for a specific new project version."""
+        rows = self.conn.execute(
+            "SELECT d.* FROM inheritance_decisions d "
+            "JOIN inheritance_reviews r ON r.id=d.review_id "
+            "WHERE r.project_id=? AND d.status IN ('kept', 'narrowed', 'dropped')",
+            (project_id,),
+        ).fetchall()
+        decisions: dict[int, sqlite3.Row] = {}
+        for row in rows:
+            previous = decisions.get(int(row["edge_id"]))
+            if previous is None or int(row["id"]) > int(previous["id"]):
+                decisions[int(row["edge_id"])] = row
+        return decisions
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _edge_active_in_project(
+        self,
+        edge: sqlite3.Row | dict[str, Any],
+        project_id: int,
+        project_name: str,
+        project_version: str | None,
+        evidence_index: dict[int, list[sqlite3.Row]],
+        decision: sqlite3.Row | None = None,
+    ) -> bool:
+        if decision is not None and decision["status"] == "dropped":
+            return False
+        if not self._edge_applies_to_project(edge, project_name):
+            return False
+        version_range = edge["version_range"] or "*"
+        source_path_filter: set[str] | None = None
+        if decision is not None and decision["status"] == "narrowed":
+            narrowed_range = decision["proposed_version_range"]
+            if narrowed_range:
+                version_range = narrowed_range
+            narrowed_paths = self._json_list(decision["proposed_source_paths_json"])
+            if narrowed_paths:
+                source_path_filter = {str(path) for path in narrowed_paths}
+        allowed_source_ids: set[int] | None = None
+        if source_path_filter is not None:
+            path_rows = self.conn.execute(
+                "SELECT id FROM manifest_sources WHERE project_id=? AND source_path IN (%s)" %
+                ",".join("?" for _ in source_path_filter),
+                (project_id, *sorted(source_path_filter)),
+            ).fetchall()
+            allowed_source_ids = {int(row[0]) for row in path_rows}
+
+        def endpoint_applies(component_id: int) -> bool:
+            entries = evidence_index.get(component_id, [])
+            if not entries:
+                return False
+            matched_source = False
+            matched_version = False
+            for entry in entries:
+                if allowed_source_ids is not None and int(entry["source_id"]) not in allowed_source_ids:
+                    continue
+                matched_source = True
+                if entry["version"] and in_range(entry["version"], version_range):
+                    matched_version = True
+            return matched_source and matched_version
+
+        return endpoint_applies(int(edge["from_component_id"])) and endpoint_applies(
+            int(edge["to_component_id"])
+        )
 
     def _compute_groups(
         self, edges: list[sqlite3.Row], project: tuple[int, str] | None = None
@@ -361,18 +466,23 @@ class Store:
             if left_root != right_root:
                 parent[max(left_root, right_root)] = min(left_root, right_root)
 
+        decisions: dict[int, sqlite3.Row] = {}
+        evidence_index: dict[int, list[sqlite3.Row]] = {}
+        project_version: str | None = None
+        if project is not None:
+            project_id = project[0]
+            decisions = self._active_inheritance_decisions(project_id)
+            evidence_index = self._project_evidence_index(project_id)
+            version_row = self.conn.execute("SELECT version FROM projects WHERE id=?", (project_id,)).fetchone()
+            project_version = version_row[0] if version_row else None
         for edge in edges:
             from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
             if project is not None:
                 project_id, project_name = project
-                if not self._edge_applies_to_project(edge, project_name):
-                    continue
-                version_range = edge["version_range"] or "*"
-                from_versions = self._component_versions_in_project(from_id, project_id)
-                to_versions = self._component_versions_in_project(to_id, project_id)
-                if not any(in_range(version, version_range) for version in from_versions):
-                    continue
-                if not any(in_range(version, version_range) for version in to_versions):
+                decision = decisions.get(int(edge["id"])) if "id" in edge.keys() else None
+                if not self._edge_active_in_project(
+                    edge, project_id, project_name, project_version, evidence_index, decision
+                ):
                     continue
             union(from_id, to_id)
         return {component_id: find(component_id) for component_id in parent}
