@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -508,6 +509,143 @@ class ScopedAliasWorkflowTests(unittest.TestCase):
         self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in history))
         report = store.project_report("demo")
         self.assertEqual(len(report["components"]), 3)
+
+
+class RevokePreviewTests(unittest.TestCase):
+    def _evidence(self, name: str, version: str, location: str) -> DependencyEvidence:
+        return DependencyEvidence(
+            ecosystem="pypi",
+            name=name,
+            version=version,
+            dependency_type=DependencyType.DIRECT,
+            location_path=location,
+            raw={"name": name, "version": version},
+        )
+
+    def _add_source(self, store: Store, project_id: int, content_hash: str, evidence: tuple) -> None:
+        source_id = store.conn.execute(
+            "INSERT INTO manifest_sources(project_id, source_path, manifest_type, content_hash, imported_at) "
+            "VALUES(?, ?, 'test', ?, 'now') RETURNING id",
+            (project_id, f"src-{content_hash}.json", content_hash),
+        ).fetchone()[0]
+        cursor = store.conn.cursor()
+        store._insert_evidence(cursor, project_id, source_id, evidence)
+        store.conn.commit()
+        store.refresh_project_components(project_id)
+
+    def _build_store(self, db: Path) -> tuple[Store, int]:
+        store = Store(db)
+        demo_id = store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES('demo', '1', 'now') RETURNING id"
+        ).fetchone()[0]
+        other_id = store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES('other', '1', 'now') RETURNING id"
+        ).fetchone()[0]
+        self._add_source(store, demo_id, "h-demo", (
+            self._evidence("alpha", "1.5", "demo/alpha"),
+            self._evidence("beta", "2.5", "demo/beta"),
+        ))
+        self._add_source(store, other_id, "h-other", (
+            self._evidence("alpha", "1.8", "other/alpha"),
+            self._evidence("beta", "2.8", "other/beta"),
+        ))
+        result = store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        self.assertEqual(sorted(result["refreshed_projects"]), [demo_id, other_id])
+        edge_id = store.list_edges("approved")[0]["id"]
+        return store, edge_id
+
+    def test_preview_cancel_confirm_and_reopen_keeps_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "sca.sqlite3"
+            export_path = Path(directory) / "preview.json"
+            store, edge_id = self._build_store(db)
+
+            merged_demo = store.project_report("demo")
+            merged_other = store.project_report("other")
+            self.assertEqual(len(merged_demo["components"]), 1)
+            self.assertEqual(len(merged_other["components"]), 1)
+            history_before = {
+                project: len(store.project_history(project)) for project in ("demo", "other")
+            }
+
+            record = store.create_revoke_preview(edge_id, created_by="alice")
+            preview_id = record["preview_id"]
+            preview = record["preview"]
+            self.assertEqual(record["status"], "previewed")
+            self.assertEqual(record["created_by"], "alice")
+            self.assertEqual(
+                {component["canonical_name"] for component in preview["split_components"]},
+                {"alpha", "beta"},
+            )
+            affected = {item["project"]: item for item in preview["affected_projects"]}
+            self.assertEqual(set(affected), {"demo", "other"})
+            for project, versions in (("demo", ["1.5", "2.5"]), ("other", ["1.8", "2.8"])):
+                self.assertTrue(affected[project]["would_change"])
+                self.assertEqual(affected[project]["version_range"], ">=1.0,<3.0")
+                side_versions = sorted(
+                    tuple(side["versions"]) for side in affected[project]["splits"]
+                )
+                self.assertEqual(side_versions, [(versions[0],), (versions[1],)])
+
+            # preview must not change current merge results or snapshots
+            self.assertEqual(store.project_report("demo"), merged_demo)
+            self.assertEqual(store.project_report("other"), merged_other)
+            self.assertEqual(
+                {project: len(store.project_history(project)) for project in ("demo", "other")},
+                history_before,
+            )
+
+            store.export_revoke_preview(preview_id, export_path)
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+            self.assertEqual(exported["preview"], preview)
+
+            # cancel keeps the approved alias and the merge result
+            cancelled = store.cancel_revoke_preview(preview_id, decided_by="bob")
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["decided_by"], "bob")
+            self.assertIsNotNone(cancelled["decided_at"])
+            self.assertEqual(store.list_edges("approved")[0]["id"], edge_id)
+            self.assertEqual(store.project_report("demo"), merged_demo)
+            with self.assertRaises(ValueError):
+                store.confirm_revoke(preview_id)
+
+            # a fresh preview can be confirmed to perform the actual revoke
+            second = store.create_revoke_preview(edge_id, created_by="alice")
+            result = store.confirm_revoke(second["preview_id"], decided_by="carol")
+            confirmed = result["preview"]
+            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(confirmed["decided_by"], "carol")
+            self.assertIsNotNone(confirmed["decided_at"])
+            self.assertEqual(result["revoke"]["revoked_edge"], edge_id)
+            self.assertEqual(store.list_edges("approved"), [])
+            self.assertEqual(len(store.project_report("demo")["components"]), 2)
+            self.assertEqual(len(store.project_report("other")["components"]), 2)
+            store.close()
+
+            # close and reopen: records persist and later rule changes cannot rewrite them
+            with Store(db) as reopened:
+                records = reopened.revoke_previews(edge_id)
+                self.assertEqual([item["status"] for item in records], ["cancelled", "confirmed"])
+                self.assertEqual(records[0]["preview"], preview)
+                self.assertEqual(records[1]["preview"], second["preview"])
+                self.assertEqual(records[1]["decided_by"], "carol")
+
+                reopened.approve_alias("pypi:alpha", "pypi:beta", version_range="*")
+                reopened.revoke_alias("pypi:alpha", "pypi:beta")
+                after = reopened.revoke_previews(edge_id)
+                self.assertEqual(after, records)
+
+    def test_revoke_preview_requires_approved_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "sca.sqlite3"
+            store, edge_id = self._build_store(db)
+            store.close()
+            with Store(db) as store:
+                pending = store.propose_alias("pypi:alpha", "pypi:beta")
+                self.assertEqual(pending["status"], "approved")
+                store.revoke_edge(edge_id)
+                with self.assertRaises(ValueError):
+                    store.create_revoke_preview(edge_id)
 
 
 if __name__ == "__main__":

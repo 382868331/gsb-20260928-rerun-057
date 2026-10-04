@@ -14,6 +14,7 @@
 - 人工别名可限定作用范围：生态系统（始终限定）、版本范围（如 `>=1.0,<2.0`）与来源项目列表。范围外的项目和版本不会被合并；批准沿用提案已确认的范围，重新提议不会悄悄扩大范围，必须先撤回再重新提议。
 - 多份待批准提案支持联合预览：单条看似合法的提案组合后可能把不兼容版本连进同一组，预览会指出冲突经过哪些提案以及涉及的原始来源路径。可以只批准一部分提案，剩余提案按新的已确认范围自动重新预览；也可以带原因拒绝提案。
 - 撤回已批准别名后，会自动重新核对与之关联的待批准提案；批准时记录的依据（note）与未采用原因（reject reason）都会保留。
+- 撤回已批准别名前可生成影响预览：列出会拆开的组件、受影响项目与版本范围，以及依赖该规则的已批准别名和继承项。预览不改动当前合并结果，可导出存档并记录操作者；取消或确认撤销都会记录操作者与时间。确认撤销后预览快照永久保留，后续规则变化不会改写旧记录。
 - 每次导入或别名变更都会保存项目扫描结论快照，撤回别名后仍可查看历史扫描结论。
 - 导入同一项目的新版本时，旧版本批准不会自动扩大到新版本：系统会生成逐项继承审阅，并列出每个决定影响的新证据。用户可以完整继承、用新版本范围缩小后继承，或明确不继承；未完成审阅期间，新版本按原始组件身份聚合。
 - 来源清单变化、版本变化以及迁移到另一生态系统会分类展示。生态系统或规范身份变化时不能继承旧批准；相同显示名仍按生态系统和规范名称区分。继承决定只向当前项目版本和当前证据来源追加作用域，旧版本的批准、证据和历史报告仍独立可读。
@@ -58,6 +59,14 @@ python -m sca.cli alias approve --db /tmp/sca.sqlite3 --edges 2,3 --note 'confir
 python -m sca.cli alias reject --db /tmp/sca.sqlite3 --edge-id 4 --reason 'distinct components'
 # 撤回已批准别名（也可按 --from/--to），并重新核对关联的待批准提案
 python -m sca.cli alias revoke --db /tmp/sca.sqlite3 --edge-id 1
+# 撤回前生成影响预览（不写合并结果），并导出存档
+python -m sca.cli alias revoke-preview --db /tmp/sca.sqlite3 --edge-id 1 +  --by alice --export /tmp/revoke-preview-1.json
+# 取消这次预览（保留已批准别名与合并结果）
+python -m sca.cli alias revoke-cancel --db /tmp/sca.sqlite3 --preview-id 1 --by bob
+# 或确认撤销：执行撤回并把预览快照标记为已确认
+python -m sca.cli alias revoke-confirm --db /tmp/sca.sqlite3 --preview-id 2 --by carol
+# 查看历史预览记录（确认后的快照不会被后续规则变化改写）
+python -m sca.cli alias revoke-previews --db /tmp/sca.sqlite3 --edge-id 1
 # 查看历史扫描结论
 python -m sca.cli history --db /tmp/sca.sqlite3 --project shopstack
 # 导入新版本后查看逐项继承审阅（items 会列出受影响证据）

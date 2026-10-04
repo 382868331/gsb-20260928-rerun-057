@@ -93,6 +93,17 @@ CREATE TABLE IF NOT EXISTS project_snapshots (
     report_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS revoke_previews (
+    id INTEGER PRIMARY KEY,
+    edge_id INTEGER NOT NULL REFERENCES alias_edges(id),
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('previewed', 'cancelled', 'confirmed')),
+    decided_at TEXT,
+    decided_by TEXT,
+    preview_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dependency_evidence (
     id INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -1283,6 +1294,197 @@ class Store:
         related = self._connected_edges(revoked_component_ids)
         affected = [edge for edge in pending if edge["id"] in related]
         return {"affected_pending": affected, "remaining_preview": self.joint_preview()}
+
+    def revoke_impact_preview(self, edge_id: int) -> dict[str, Any]:
+        row = self._edge_row(edge_id)
+        if row["status"] != "approved":
+            raise ValueError(f"edge #{edge_id} is {row['status']}, not approved")
+        from_id, to_id = int(row["from_component_id"]), int(row["to_component_id"])
+        group_ids = self._edge_component_group(from_id) | self._edge_component_group(to_id)
+        approved = self._approved_edge_rows()
+        simulated = [edge for edge in approved if int(edge["id"]) != edge_id]
+        placeholders = ",".join("?" for _ in group_ids)
+        project_rows = self.conn.execute(
+            f"SELECT DISTINCT p.id, p.name, p.version FROM projects p "
+            f"JOIN dependency_evidence e ON e.project_id=p.id "
+            f"WHERE e.component_id IN ({placeholders}) ORDER BY p.id",
+            tuple(sorted(group_ids)),
+        ).fetchall()
+        cursor = self.conn.cursor()
+        split_component_ids: set[int] = set()
+        affected_projects: list[dict[str, Any]] = []
+        for project_row in project_rows:
+            project_id = int(project_row["id"])
+            project_name, project_version = project_row["name"], project_row["version"]
+            project = (project_id, project_name, project_version)
+            before = self._compute_groups(approved, project)
+            after = self._compute_groups(simulated, project)
+            present = [
+                component_id
+                for component_id in sorted(group_ids)
+                if self._component_versions_in_project(component_id, project_id)
+            ]
+            before_root = before.get(from_id, from_id)
+            merged_before = [
+                component_id
+                for component_id in present
+                if before.get(component_id, component_id) == before_root
+            ]
+            clusters: dict[int, list[int]] = {}
+            for component_id in merged_before:
+                clusters.setdefault(after.get(component_id, component_id), []).append(component_id)
+            scope = self._edge_project_scope(row, project_name, project_version) or {}
+            version_range = scope.get("range") or row["version_range"] or "*"
+            if len(clusters) < 2:
+                affected_projects.append(
+                    {
+                        "project_id": project_id,
+                        "project": project_name,
+                        "project_version": project_version,
+                        "version_range": version_range,
+                        "would_change": False,
+                        "splits": [],
+                    }
+                )
+                continue
+            split_component_ids.update(merged_before)
+            sides = []
+            for component_ids in clusters.values():
+                versions = sorted(
+                    {
+                        version
+                        for component_id in component_ids
+                        for version in self._component_versions_in_project(component_id, project_id)
+                    }
+                )
+                sides.append(
+                    {
+                        "components": [
+                            self._component_row(cursor, component_id)["purl"]
+                            for component_id in component_ids
+                        ],
+                        "versions": versions,
+                    }
+                )
+            affected_projects.append(
+                {
+                    "project_id": project_id,
+                    "project": project_name,
+                    "project_version": project_version,
+                    "version_range": version_range,
+                    "would_change": True,
+                    "splits": sides,
+                }
+            )
+        connected = self._connected_edges({from_id, to_id})
+        dependent_approved = [
+            self.edge_dict(edge)
+            for edge in approved
+            if int(edge["id"]) != edge_id and int(edge["id"]) in connected
+        ]
+        inheritance_rows = self.conn.execute(
+            "SELECT i.id, i.plan_id, i.status, i.classification, p.project_name, p.to_version "
+            "FROM inheritance_items i JOIN inheritance_plans p ON p.id=i.plan_id "
+            "WHERE i.source_edge_id=? ORDER BY i.id",
+            (edge_id,),
+        ).fetchall()
+        dependent_inheritance = [
+            {
+                "item_id": int(item["id"]),
+                "plan_id": int(item["plan_id"]),
+                "project": item["project_name"],
+                "to_version": item["to_version"],
+                "classification": item["classification"],
+                "status": item["status"],
+            }
+            for item in inheritance_rows
+        ]
+        return {
+            "edge": self.edge_dict(row),
+            "split_components": [
+                dict(self._component_row(cursor, component_id))
+                for component_id in sorted(split_component_ids)
+            ],
+            "affected_projects": affected_projects,
+            "dependent_approved": dependent_approved,
+            "dependent_inheritance": dependent_inheritance,
+        }
+
+    def create_revoke_preview(self, edge_id: int, *, created_by: str = "operator") -> dict[str, Any]:
+        preview = self.revoke_impact_preview(edge_id)
+        now = utc_now()
+        with self._transaction():
+            cursor = self.conn.execute(
+                "INSERT INTO revoke_previews(edge_id, created_at, created_by, status, preview_json) "
+                "VALUES(?, ?, ?, 'previewed', ?)",
+                (edge_id, now, created_by, json.dumps(preview, ensure_ascii=False, sort_keys=True)),
+            )
+            preview_id = int(cursor.lastrowid)
+        return self.revoke_preview_record(preview_id)
+
+    def _revoke_preview_row(self, preview_id: int) -> sqlite3.Row:
+        row = self.conn.execute(
+            "SELECT * FROM revoke_previews WHERE id=?", (preview_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"revoke preview not found: #{preview_id}")
+        return row
+
+    def _revoke_preview_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "preview_id": int(row["id"]),
+            "edge_id": int(row["edge_id"]),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "created_by": row["created_by"],
+            "decided_at": row["decided_at"],
+            "decided_by": row["decided_by"],
+            "preview": json.loads(row["preview_json"]),
+        }
+
+    def revoke_preview_record(self, preview_id: int) -> dict[str, Any]:
+        return self._revoke_preview_dict(self._revoke_preview_row(preview_id))
+
+    def revoke_previews(self, edge_id: int | None = None) -> list[dict[str, Any]]:
+        if edge_id is None:
+            rows = self.conn.execute("SELECT * FROM revoke_previews ORDER BY id").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM revoke_previews WHERE edge_id=? ORDER BY id", (edge_id,)
+            ).fetchall()
+        return [self._revoke_preview_dict(row) for row in rows]
+
+    def cancel_revoke_preview(self, preview_id: int, *, decided_by: str = "operator") -> dict[str, Any]:
+        row = self._revoke_preview_row(preview_id)
+        if row["status"] != "previewed":
+            raise ValueError(f"revoke preview #{preview_id} is {row['status']}, not previewed")
+        with self._transaction():
+            self.conn.execute(
+                "UPDATE revoke_previews SET status='cancelled', decided_at=?, decided_by=? WHERE id=?",
+                (utc_now(), decided_by, preview_id),
+            )
+        return self.revoke_preview_record(preview_id)
+
+    def confirm_revoke(self, preview_id: int, *, decided_by: str = "operator") -> dict[str, Any]:
+        row = self._revoke_preview_row(preview_id)
+        if row["status"] != "previewed":
+            raise ValueError(f"revoke preview #{preview_id} is {row['status']}, not previewed")
+        result = self.revoke_edge(int(row["edge_id"]), decided_by=decided_by)
+        with self._transaction():
+            self.conn.execute(
+                "UPDATE revoke_previews SET status='confirmed', decided_at=?, decided_by=? WHERE id=?",
+                (utc_now(), decided_by, preview_id),
+            )
+        return {"preview": self.revoke_preview_record(preview_id), "revoke": result}
+
+    def export_revoke_preview(self, preview_id: int, path: str | Path) -> Path:
+        record = self.revoke_preview_record(preview_id)
+        target = Path(path)
+        target.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return target
 
     def _connected_edges(self, seed_component_ids: set[int]) -> set[int]:
         rows = self.conn.execute(
