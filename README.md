@@ -15,6 +15,9 @@
 - 多份待批准提案支持联合预览：单条看似合法的提案组合后可能把不兼容版本连进同一组，预览会指出冲突经过哪些提案以及涉及的原始来源路径。可以只批准一部分提案，剩余提案按新的已确认范围自动重新预览；也可以带原因拒绝提案。
 - 撤回已批准别名后，会自动重新核对与之关联的待批准提案；批准时记录的依据（note）与未采用原因（reject reason）都会保留。
 - 每次导入或别名变更都会保存项目扫描结论快照，撤回别名后仍可查看历史扫描结论。
+- 导入同一项目的新版本时，旧版本批准不会自动扩大到新版本：系统会生成逐项继承审阅，并列出每个决定影响的新证据。用户可以完整继承、用新版本范围缩小后继承，或明确不继承；未完成审阅期间，新版本按原始组件身份聚合。
+- 来源清单变化、版本变化以及迁移到另一生态系统会分类展示。生态系统或规范身份变化时不能继承旧批准；相同显示名仍按生态系统和规范名称区分。继承决定只向当前项目版本和当前证据来源追加作用域，旧版本的批准、证据和历史报告仍独立可读。
+- 继承审阅可保存后重新打开；撤回已继承或已缩小的单项决定会移除该版本的新增作用域并重新聚合，但不会删除或改写旧版本依据。
 
 ## 演示场景
 
@@ -57,6 +60,18 @@ python -m sca.cli alias reject --db /tmp/sca.sqlite3 --edge-id 4 --reason 'disti
 python -m sca.cli alias revoke --db /tmp/sca.sqlite3 --edge-id 1
 # 查看历史扫描结论
 python -m sca.cli history --db /tmp/sca.sqlite3 --project shopstack
+# 导入新版本后查看逐项继承审阅（items 会列出受影响证据）
+python -m sca.cli inheritance show --db /tmp/sca.sqlite3 \
+  --project shopstack --project-version 2.1.0
+# 继承第 1 项；第 2 项缩小到新版本范围；第 3 项不继承
+python -m sca.cli inheritance decide --db /tmp/sca.sqlite3 --plan-id 1 \
+  --items 1 --decision inherit --note 'same renamed component'
+python -m sca.cli inheritance decide --db /tmp/sca.sqlite3 --plan-id 1 \
+  --items 2 --decision narrowed --versions '>=2.0,<3.0'
+python -m sca.cli inheritance decide --db /tmp/sca.sqlite3 --plan-id 1 \
+  --items 3 --decision skipped --note 'source changed independently'
+# 重开并撤回部分决定
+python -m sca.cli inheritance reopen --db /tmp/sca.sqlite3 --plan-id 1 --items 1
 ```
 
 既有数据库在首次打开时会自动迁移：别名表补充版本范围、来源范围、批准依据与未采用原因等列，原有记录、来源路径与历史快照全部保留，既有别名的默认范围为不限（`*`）。

@@ -84,6 +84,25 @@ def _print_edge(edge: dict) -> None:
         print(f"    reject reason: {edge['reject_reason']}")
 
 
+def _print_inheritance_review(review: dict) -> None:
+    print(
+        f"inheritance plan #{review['plan_id']}: {review['project']} "
+        f"{review['from_version']} -> {review['to_version']}"
+    )
+    if review["finalized_at"]:
+        print(f"finalized: {review['finalized_at']}")
+    for item in review["items"]:
+        edge = item["source_edge"]
+        print(f"#{item['id']} [{item['status']}] {item['classification']}: {edge['from_purl']} <-> {edge['to_purl']}")
+        for evidence in item["affected_evidence"]:
+            print(
+                f"  evidence: {evidence['purl']} {evidence['version']} "
+                f"{evidence['source_path']} :: {evidence['location_path']}"
+            )
+        if item.get("note"):
+            print(f"  note: {item['note']}")
+
+
 def _print_joint_preview(preview: dict) -> None:
     print(f"joint preview of {len(preview['candidates'])} pending proposal(s)")
     for candidate in preview["candidates"]:
@@ -171,6 +190,29 @@ def build_parser() -> argparse.ArgumentParser:
     history_parser.add_argument("--project-version")
     history_parser.add_argument("--snapshot-id", type=int)
     history_parser.add_argument("--json", action="store_true")
+
+    inheritance_parser = subparsers.add_parser("inheritance", help="review alias inheritance for a new project version")
+    inheritance_subparsers = inheritance_parser.add_subparsers(dest="inheritance_command", required=True)
+    show_parser = inheritance_subparsers.add_parser("show")
+    show_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    show_parser.add_argument("--project", required=True)
+    show_parser.add_argument("--project-version", required=True)
+    show_parser.add_argument("--json", action="store_true")
+    decide_parser = inheritance_subparsers.add_parser("decide")
+    decide_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    decide_parser.add_argument("--plan-id", type=int, required=True)
+    decide_parser.add_argument("--items", help="comma-separated review item ids; omit means all pending")
+    decide_parser.add_argument("--decision", choices=("inherit", "narrowed", "skipped"), required=True)
+    decide_parser.add_argument("--versions", default="*")
+    decide_parser.add_argument("--by", default="operator")
+    decide_parser.add_argument("--note")
+    decide_parser.add_argument("--json", action="store_true")
+    reopen_parser = inheritance_subparsers.add_parser("reopen")
+    reopen_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    reopen_parser.add_argument("--plan-id", type=int, required=True)
+    reopen_parser.add_argument("--items", required=True, help="comma-separated review item ids")
+    reopen_parser.add_argument("--by", default="operator")
+    reopen_parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -266,6 +308,38 @@ def main(argv: list[str] | None = None) -> int:
                         f"#{entry['snapshot_id']} {entry['taken_at']} ({entry['reason']}) "
                         f"components={len(components)} conflicts={conflicts}"
                     )
+    elif args.command == "inheritance":
+        with Store(args.db) as store:
+            if args.inheritance_command == "show":
+                review = store.inheritance_review(args.project, args.project_version)
+                if review is None:
+                    raise SystemExit("no inheritance review found")
+                if args.json:
+                    print(json.dumps(review, ensure_ascii=False, indent=2))
+                else:
+                    _print_inheritance_review(review)
+            elif args.inheritance_command == "decide":
+                item_ids = _parse_edge_ids(args.items)
+                result = store.decide_inheritance(
+                    args.plan_id,
+                    item_ids,
+                    args.decision,
+                    version_range=args.versions,
+                    decided_by=args.by,
+                    note=args.note,
+                )
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_inheritance_review(result["review"])
+            elif args.inheritance_command == "reopen":
+                result = store.reopen_inheritance_items(
+                    args.plan_id, _parse_edge_ids(args.items), decided_by=args.by
+                )
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_inheritance_review(result["review"])
     return 0
 
 

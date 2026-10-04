@@ -266,9 +266,118 @@ class AliasWorkflowTests(unittest.TestCase):
         store.approve_alias("maven:com.a:lib", "maven:com.b:lib")
         self.assertEqual(len(store.project_report("demo")["components"]), 1)
 
+class InheritanceWorkflowTests(unittest.TestCase):
+    def _manifest(self, version: str, path: str, names: tuple[tuple[str, str], ...], ecosystem: str = "pypi") -> ParsedManifest:
+        return ParsedManifest(
+            project="shopstack",
+            project_version=version,
+            source_path=path,
+            manifest_type="test",
+            evidence=tuple(
+                DependencyEvidence(
+                    ecosystem=ecosystem,
+                    name=name,
+                    version=component_version,
+                    dependency_type=DependencyType.DIRECT,
+                    location_path=f"{path}#{name}",
+                    raw={"name": name, "version": component_version, "source": path},
+                )
+                for name, component_version in names
+            ),
+        )
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_version_change_requires_per_item_inheritance_and_reopen_keeps_old_basis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "sca.sqlite3"
+            store = Store(db)
+            first = store.import_manifest(
+                self._manifest(
+                    "1.0.0",
+                    "v1-lock.json",
+                    (("alpha", "1.0"), ("beta", "1.0"), ("gamma", "1.2"), ("delta", "1.2"), ("epsilon", "1.4"), ("zeta", "1.4")),
+                ),
+                b"v1",
+            )
+            self.assertIsNone(first["inheritance_plan_id"])
+            store.approve_alias("pypi:alpha", "pypi:beta", note="same vendor rename")
+            store.approve_alias("pypi:gamma", "pypi:delta")
+            store.approve_alias("pypi:epsilon", "pypi:zeta")
+
+            v2_manifest = self._manifest(
+                "2.0.0",
+                "v2-lock.json",
+                (("alpha", "2.0"), ("beta", "2.0"), ("gamma", "2.2"), ("delta", "2.2"), ("epsilon", "2.4"), ("zeta", "2.4")),
+            )
+            second = store.import_manifest(v2_manifest, b"v2")
+            duplicate = store.import_manifest(v2_manifest, b"v2")
+            self.assertEqual(second["inserted_records"], 6)
+            self.assertEqual(duplicate["inserted_records"], 0)
+            self.assertEqual(duplicate["inheritance_plan_id"], second["inheritance_plan_id"])
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM components WHERE ecosystem='pypi'").fetchone()[0], 6)
+
+            review = store.inheritance_review("shopstack", "2.0.0")
+            store.close()
+            store = Store(db)
+            review = store.inheritance_review("shopstack", "2.0.0")
+            self.assertIsNotNone(review)
+            self.assertEqual([item["status"] for item in review["items"]], ["pending"] * 3)
+            self.assertEqual({item["classification"] for item in review["items"]}, {"source_changed"})
+            self.assertEqual(len({item["source_edge"]["id"] for item in review["items"]}), 3)
+            for item in review["items"]:
+                self.assertEqual(len(item["affected_evidence"]), 2)
+                self.assertTrue(all(evidence["source_path"] == "v2-lock.json" for evidence in item["affected_evidence"]))
+
+            self.assertEqual(len(store.project_report("shopstack", "1.0.0")["components"]), 3)
+            self.assertEqual(len(store.project_report("shopstack", "2.0.0")["components"]), 6)
+
+            plan_id = second["inheritance_plan_id"]
+            inherited, narrowed, skipped = [item["id"] for item in review["items"]]
+            store.decide_inheritance(plan_id, [inherited], "inherit", note="vendor identity remains valid")
+            store.decide_inheritance(plan_id, [narrowed], "narrowed", version_range=">=2.0")
+            store.decide_inheritance(plan_id, [skipped], "skipped", note="source changed independently")
+
+            new_report = store.project_report("shopstack", "2.0.0")
+            self.assertEqual(len(new_report["components"]), 4)
+            merged_purls = {component["purl"] for component in new_report["components"]}
+            self.assertIn("pkg:pypi/alpha", merged_purls)
+            self.assertIn("pkg:pypi/gamma", merged_purls)
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM project_components WHERE project_id=2").fetchone()[0], 4)
+
+            reopened = store.reopen_inheritance_items(plan_id, [inherited])
+            self.assertEqual(reopened["review"]["items"][0]["status"], "pending")
+            self.assertEqual(len(store.project_report("shopstack", "2.0.0")["components"]), 5)
+            self.assertEqual(len(store.project_report("shopstack", "1.0.0")["components"]), 3)
+            store.decide_inheritance(plan_id, [inherited], "skipped")
+            self.assertEqual(len(store.project_report("shopstack", "2.0.0")["components"]), 5)
+
+            old_history = store.project_history("shopstack", "1.0.0")
+            self.assertTrue(any(entry["reason"] == "alias-approve" and len(entry["report"]["components"]) == 3 for entry in old_history))
+            store.close()
+
+    def test_same_names_in_another_ecosystem_do_not_inherit_old_approval(self) -> None:
+        with Store() as store:
+            store.import_manifest(
+                self._manifest("1.0.0", "py-lock.json", (("alpha", "1.0"), ("beta", "1.0")), "pypi"),
+                b"py",
+            )
+            store.approve_alias("pypi:alpha", "pypi:beta")
+            result = store.import_manifest(
+                self._manifest("2.0.0", "js-lock.json", (("alpha", "2.0"), ("beta", "2.0")), "npm"),
+                b"js",
+            )
+            review = store.inheritance_review("shopstack", "2.0.0")
+            self.assertIsNotNone(review)
+            item = review["items"][0]
+            self.assertEqual(item["classification"], "ecosystem_or_identity_changed")
+            self.assertEqual({evidence["ecosystem"] for evidence in item["affected_evidence"]}, {"npm"})
+            self.assertEqual(len(store.project_report("shopstack", "2.0.0")["components"]), 2)
+            with self.assertRaises(ValueError):
+                store.decide_inheritance(result["inheritance_plan_id"], [item["id"]], "inherit")
+            store.decide_inheritance(result["inheritance_plan_id"], [item["id"]], "skipped")
+            self.assertEqual(
+                {component["purl"] for component in store.project_report("shopstack", "2.0.0")["components"]},
+                {"pkg:npm/alpha", "pkg:npm/beta"},
+            )
 
 
 class ScopedAliasWorkflowTests(unittest.TestCase):
@@ -399,3 +508,7 @@ class ScopedAliasWorkflowTests(unittest.TestCase):
         self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in history))
         report = store.project_report("demo")
         self.assertEqual(len(report["components"]), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
