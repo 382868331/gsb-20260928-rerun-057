@@ -503,7 +503,7 @@ class Store:
         for row in rows:
             component_id = int(row["component_id"])
             by_component.setdefault(component_id, []).append(row)
-            find(component_id)
+            find(int(row["evidence_id"]))
         for edge in self._approved_edge_rows():
             if not self._edge_applies_to_project(edge, project_name, project_version):
                 continue
@@ -523,10 +523,20 @@ class Store:
                     matched = []
                     break
                 matched.extend(endpoint_matches)
-            for evidence_id in matched:
-                union(evidence_id, int(edge["from_component_id"]))
-                union(evidence_id, int(edge["to_component_id"]))
-        return {int(row["evidence_id"]): find(int(row["evidence_id"])) for row in rows}
+            for evidence_id in matched[1:]:
+                union(matched[0], evidence_id)
+        members_by_root: dict[int, list[int]] = {}
+        for row in rows:
+            root_evidence_id = find(int(row["evidence_id"]))
+            members_by_root.setdefault(root_evidence_id, []).append(int(row["component_id"]))
+        root_component = {
+            root_evidence_id: min(component_ids)
+            for root_evidence_id, component_ids in members_by_root.items()
+        }
+        return {
+            int(row["evidence_id"]): root_component[find(int(row["evidence_id"]))]
+            for row in rows
+        }
 
     def alias_preview(
         self,
