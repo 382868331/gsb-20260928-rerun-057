@@ -510,5 +510,240 @@ class ScopedAliasWorkflowTests(unittest.TestCase):
         self.assertEqual(len(report["components"]), 3)
 
 
+class RevocationPreviewWorkflowTests(unittest.TestCase):
+    def _store(self) -> Store:
+        return Store()
+
+    def _project(self, store: Store, name: str, version: str = "1.0") -> int:
+        return store.conn.execute(
+            "INSERT INTO projects(name, version, created_at) VALUES(?, ?, 'now') RETURNING id",
+            (name, version),
+        ).fetchone()[0]
+
+    def _evidence(self, name: str, version: str, location: str) -> DependencyEvidence:
+        return DependencyEvidence(
+            ecosystem="pypi",
+            name=name,
+            version=version,
+            dependency_type=DependencyType.DIRECT,
+            location_path=location,
+            raw={"name": name, "version": version},
+        )
+
+    def _add_source(self, store: Store, project_id: int, content_hash: str, evidence: tuple) -> None:
+        source_id = store.conn.execute(
+            "INSERT INTO manifest_sources(project_id, source_path, manifest_type, content_hash, imported_at) "
+            "VALUES(?, ?, 'test', ?, 'now') RETURNING id",
+            (project_id, f"src-{content_hash}.json", content_hash),
+        ).fetchone()[0]
+        cursor = store.conn.cursor()
+        store._insert_evidence(cursor, project_id, source_id, evidence)
+        store.conn.commit()
+        store.refresh_project_components(project_id)
+
+    def _two_projects_store(self) -> Store:
+        store = self._store()
+        portal = self._project(store, "portal", "3.1.0")
+        self._add_source(store, portal, "portal-lock", (
+            self._evidence("alpha", "1.2.0", "portal/alpha"),
+            self._evidence("beta", "1.9.0", "portal/beta"),
+        ))
+        shop = self._project(store, "shop", "2.4.0")
+        self._add_source(store, shop, "shop-lock", (
+            self._evidence("alpha", "1.5.0", "shop/alpha"),
+            self._evidence("beta", "2.1.0", "shop/beta"),
+            self._evidence("gamma", "2.1.0", "shop/gamma"),
+        ))
+        return store
+
+    def test_preview_lists_splits_projects_ranges_and_dependents_without_changing_merges(self) -> None:
+        store = self._two_projects_store()
+        store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0", decided_by="owner")
+        edge = store.list_edges("approved")[0]
+        dependent = store.propose_alias("pypi:beta", "pypi:gamma")
+
+        components_before = {
+            name: len(store.project_report(name)["components"]) for name in ("portal", "shop")
+        }
+        self.assertEqual(components_before, {"portal": 1, "shop": 2})
+        history_before = {
+            name: [entry["reason"] for entry in store.project_history(name)]
+            for name in ("portal", "shop")
+        }
+
+        preview = store.create_revocation_preview(edge["id"], created_by="auditor")
+        self.assertEqual(preview["status"], "open")
+        self.assertEqual(preview["created_by"], "auditor")
+        self.assertIsNone(preview["confirmed_at"])
+        self.assertEqual(
+            {component["purl"] for component in preview["split_components"]},
+            {"pkg:pypi/alpha", "pkg:pypi/beta"},
+        )
+        projects = {(item["project"], item["project_version"]): item for item in preview["affected_projects"]}
+        self.assertEqual(set(projects), {("portal", "3.1.0"), ("shop", "2.4.0")})
+        for impact in projects.values():
+            self.assertEqual(impact["edge_version_range"], ">=1.0,<3.0")
+            self.assertEqual(len(impact["groups"]), 2)
+            roots = {group["purl"] for group in impact["groups"]}
+            self.assertEqual(roots, {"pkg:pypi/alpha", "pkg:pypi/beta"})
+            self.assertTrue(all(evidence["source_path"] for group in impact["groups"] for evidence in group["evidence"]))
+        self.assertEqual(preview["edge"]["id"], edge["id"])
+        self.assertEqual([candidate["id"] for candidate in preview["dependent_candidates"]], [dependent["edge_id"]])
+
+        # creating a preview must not change current merge results or add snapshots
+        self.assertEqual(
+            {name: len(store.project_report(name)["components"]) for name in ("portal", "shop")},
+            components_before,
+        )
+        for name in ("portal", "shop"):
+            self.assertEqual(
+                [entry["reason"] for entry in store.project_history(name)],
+                history_before[name],
+            )
+
+    def test_cancel_then_recreate_preview_and_snapshot_survives_closing_and_reopening(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "sca.sqlite3"
+            store = Store(db)
+            portal = self._project(store, "portal", "3.1.0")
+            self._add_source(store, portal, "portal-lock", (
+                self._evidence("alpha", "1.2.0", "portal/alpha"),
+                self._evidence("beta", "1.9.0", "portal/beta"),
+            ))
+            shop = self._project(store, "shop", "2.4.0")
+            self._add_source(store, shop, "shop-lock", (
+                self._evidence("alpha", "1.5.0", "shop/alpha"),
+                self._evidence("beta", "2.1.0", "shop/beta"),
+            ))
+            store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+            edge_id = store.list_edges("approved")[0]["id"]
+
+            first = store.create_revocation_preview(edge_id, created_by="auditor")
+            self.assertEqual(first["preview_id"], 1)
+            cancelled = store.cancel_revocation_preview(first["preview_id"], cancelled_by="auditor")
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["cancelled_by"], "auditor")
+            self.assertIsNotNone(cancelled["cancelled_at"])
+            # cancelling a preview keeps the alias in force and merges unchanged
+            self.assertEqual(len(store.project_report("portal")["components"]), 1)
+            with self.assertRaises(ValueError):
+                store.confirm_revocation_preview(first["preview_id"])
+
+            second = store.create_revocation_preview(edge_id, created_by="auditor")
+            self.assertEqual(second["preview_id"], 2)
+
+            # close and reopen the database: open preview must still be readable
+            store.close()
+            store = Store(db)
+            reopened_first = store.revocation_preview(1)
+            reopened_second = store.revocation_preview(2)
+            self.assertEqual(reopened_first["status"], "cancelled")
+            self.assertEqual(reopened_second["status"], "open")
+            self.assertEqual(
+                {item["project"] for item in reopened_second["affected_projects"]},
+                {"portal", "shop"},
+            )
+
+            result = store.confirm_revocation_preview(2, confirmed_by="operator")
+            self.assertEqual(result["preview"]["status"], "confirmed")
+            self.assertEqual(result["preview"]["confirmed_by"], "operator")
+            self.assertIsNotNone(result["preview"]["confirmed_at"])
+            self.assertEqual(len(store.project_report("portal")["components"]), 2)
+            self.assertEqual(len(store.project_report("shop")["components"]), 2)
+            self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in store.project_history("portal")))
+            self.assertTrue(any(entry["reason"] == "alias-revoke" for entry in store.project_history("shop")))
+
+            # close/reopen after confirmation: snapshot is retained and immutable
+            store.close()
+            store = Store(db)
+            confirmed = store.revocation_preview(2)
+            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(
+                {component["purl"] for component in confirmed["split_components"]},
+                {"pkg:pypi/alpha", "pkg:pypi/beta"},
+            )
+            self.assertEqual(
+                {item["project"] for item in confirmed["affected_projects"]},
+                {"portal", "shop"},
+            )
+            with self.assertRaises(ValueError):
+                store.cancel_revocation_preview(2)
+            store.close()
+
+    def test_later_rule_changes_never_rewrite_old_preview_records(self) -> None:
+        store = self._two_projects_store()
+        store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        edge_id = store.list_edges("approved")[0]["id"]
+        preview = store.create_revocation_preview(edge_id, created_by="auditor")
+        result = store.confirm_revocation_preview(preview["preview_id"], confirmed_by="operator")
+        frozen = store.revocation_preview(preview["preview_id"])
+        self.assertEqual(
+            [item["project"] for item in frozen["affected_projects"]],
+            [item["project"] for item in preview["affected_projects"]],
+        )
+
+        # re-approve with a different, non-overlapping range; the old record stays as captured
+        store.propose_alias("pypi:alpha", "pypi:beta", version_range=">=9.0")
+        store.approve_alias("pypi:alpha", "pypi:beta")
+        latest = store.list_edges("approved")[0]
+        self.assertEqual(latest["version_range"], ">=9.0")
+        # range >=9.0 merges nothing here, both projects remain split
+        self.assertEqual(len(store.project_report("portal")["components"]), 2)
+        self.assertEqual(len(store.project_report("shop")["components"]), 3)
+
+        old_record = store.revocation_preview(preview["preview_id"])
+        self.assertEqual(old_record["status"], "confirmed")
+        self.assertEqual(old_record["confirmed_by"], "operator")
+        self.assertEqual(
+            [item["edge_version_range"] for item in old_record["affected_projects"]],
+            [">=1.0,<3.0", ">=1.0,<3.0"],
+        )
+        self.assertEqual(
+            {component["purl"] for component in old_record["split_components"]},
+            {"pkg:pypi/alpha", "pkg:pypi/beta"},
+        )
+        self.assertEqual(
+            {item["project"] for item in old_record["affected_projects"]},
+            {"portal", "shop"},
+        )
+        listed = store.list_revocation_previews(status="confirmed")
+        self.assertEqual([item["preview_id"] for item in listed], [preview["preview_id"]])
+        self.assertEqual(result["revoked_edge"], edge_id)
+
+    def test_exported_preview_contains_operator_and_confirmation_time(self) -> None:
+        store = self._two_projects_store()
+        store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        edge_id = store.list_edges("approved")[0]["id"]
+        preview = store.create_revocation_preview(edge_id, created_by="auditor")
+        with self.assertRaises(ValueError):
+            store.create_revocation_preview(edge_id)
+        export_before = store.export_revocation_preview(preview["preview_id"], exported_by="exporter")
+        self.assertEqual(export_before["document"], "alias-revocation-impact-preview")
+        self.assertEqual(export_before["preview"]["confirmed_at"], None)
+        self.assertTrue(export_before["exported_at"])
+
+        store.confirm_revocation_preview(preview["preview_id"], confirmed_by="final-owner")
+        export_after = store.export_revocation_preview(preview["preview_id"], exported_by="exporter")
+        frozen = export_after["preview"]
+        self.assertEqual(frozen["created_by"], "auditor")
+        self.assertEqual(frozen["confirmed_by"], "final-owner")
+        self.assertTrue(frozen["confirmed_at"])
+        self.assertEqual(
+            {item["project"] for item in frozen["affected_projects"]},
+            {"portal", "shop"},
+        )
+
+    def test_confirm_without_operator_defaults_to_preview_creator(self) -> None:
+        store = self._two_projects_store()
+        store.approve_alias("pypi:alpha", "pypi:beta", version_range=">=1.0,<3.0")
+        edge_id = store.list_edges("approved")[0]["id"]
+        preview = store.create_revocation_preview(edge_id, created_by="creator-only")
+        result = store.confirm_revocation_preview(preview["preview_id"])
+        self.assertEqual(result["preview"]["confirmed_by"], "creator-only")
+        self.assertEqual(
+            store.edge_dict(store._edge_row(edge_id))["decided_by"], "creator-only"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

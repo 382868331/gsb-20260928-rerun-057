@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS project_snapshots (
     report_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS revocation_previews (
+    id INTEGER PRIMARY KEY,
+    edge_id INTEGER NOT NULL REFERENCES alias_edges(id),
+    status TEXT NOT NULL CHECK(status IN ('open', 'cancelled', 'confirmed')),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    cancelled_by TEXT,
+    cancelled_at TEXT,
+    confirmed_by TEXT,
+    confirmed_at TEXT,
+    preview_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dependency_evidence (
     id INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -1275,6 +1288,276 @@ class Store:
             )
         recheck = self._recheck_pending_after_revoke({from_id, to_id})
         return {"revoked_edge": edge_id, "refreshed_projects": affected, "affected_pending": recheck["affected_pending"], "remaining_preview": recheck["remaining_preview"]}
+
+    def _component_dict(self, component_id: int) -> dict[str, Any]:
+        return dict(self._component_row(self.conn.cursor(), component_id))
+
+    def _revocation_project_impact(self, edge: sqlite3.Row, project_id: int) -> dict[str, Any] | None:
+        project = self._project_row(self.conn.cursor(), project_id)
+        project_name, project_version = project["name"], project["version"]
+        if not self._edge_applies_to_project(edge, project_name, project_version):
+            return None
+        from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
+        current_groups = self.alias_groups(project_id)
+        if current_groups.get(from_id, from_id) != current_groups.get(to_id, to_id):
+            return None
+        merged_root = current_groups[from_id]
+        simulated = [row for row in self._approved_edge_rows() if int(row["id"]) != int(edge["id"])]
+        split_groups = self._compute_groups(
+            simulated, (project_id, project_name, project_version)
+        )
+        if split_groups.get(from_id, from_id) == split_groups.get(to_id, to_id):
+            return None
+        scope = self._edge_project_scope(edge, project_name, project_version) or {}
+        effective_range = scope.get("range") or edge["version_range"] or "*"
+        allowed_paths = scope.get("source_paths")
+        member_ids = sorted(
+            {
+                component_id
+                for component_id, group_root in current_groups.items()
+                if group_root == merged_root
+            }
+            | {merged_root}
+        )
+        evidence_rows = self.conn.execute(
+            """
+            SELECT e.component_id, e.version, e.location_path, e.dependency_type,
+                   s.source_path, c.ecosystem, c.canonical_name, c.purl
+            FROM dependency_evidence e
+            JOIN manifest_sources s ON s.id=e.source_id
+            JOIN components c ON c.id=e.component_id
+            WHERE e.project_id=?
+            ORDER BY e.id
+            """,
+            (project_id,),
+        ).fetchall()
+        buckets: dict[int, dict[str, Any]] = {}
+        for evidence in evidence_rows:
+            component_id = int(evidence["component_id"])
+            if current_groups.get(component_id, component_id) != merged_root:
+                continue
+            if allowed_paths is not None and evidence["source_path"] not in allowed_paths:
+                continue
+            if evidence["version"] and not in_range(evidence["version"], effective_range):
+                continue
+            new_root = split_groups.get(component_id, component_id)
+            bucket = buckets.setdefault(
+                new_root,
+                {"components": set(), "versions": set(), "evidence": []},
+            )
+            bucket["components"].add(component_id)
+            if evidence["version"]:
+                bucket["versions"].add(evidence["version"])
+            bucket["evidence"].append(
+                {
+                    "purl": evidence["purl"],
+                    "canonical_name": evidence["canonical_name"],
+                    "version": evidence["version"],
+                    "source_path": evidence["source_path"],
+                    "location_path": evidence["location_path"],
+                    "dependency_type": evidence["dependency_type"],
+                }
+            )
+        groups_out = []
+        for new_root, bucket in sorted(buckets.items()):
+            root_row = self._component_row(self.conn.cursor(), new_root)
+            groups_out.append(
+                {
+                    "root_component_id": new_root,
+                    "purl": root_row["purl"],
+                    "ecosystem": root_row["ecosystem"],
+                    "canonical_name": root_row["canonical_name"],
+                    "components": [self._component_dict(component_id) for component_id in sorted(bucket["components"])],
+                    "versions": sorted(bucket["versions"]),
+                    "evidence": bucket["evidence"],
+                }
+            )
+        if len(groups_out) < 2:
+            return None
+        return {
+            "project_id": project_id,
+            "project": project_name,
+            "project_version": project_version,
+            "edge_version_range": effective_range,
+            "edge_sources": scope.get("source_paths") if allowed_paths is not None else None,
+            "groups": groups_out,
+        }
+
+    def revocation_impact(self, edge_id: int) -> dict[str, Any]:
+        """Compute the impact of revoking one approved edge without writing anything."""
+        edge = self._edge_row(edge_id)
+        if edge["status"] != "approved":
+            raise ValueError(f"edge #{edge_id} is {edge['status']}, not approved")
+        from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
+        project_rows = self.conn.execute(
+            """
+            SELECT DISTINCT p.id FROM projects p
+            JOIN dependency_evidence e ON e.project_id=p.id
+            WHERE e.component_id IN (?, ?)
+            ORDER BY p.id
+            """,
+            (from_id, to_id),
+        ).fetchall()
+        affected_projects = []
+        split_component_ids: set[int] = set()
+        for project_row in project_rows:
+            impact = self._revocation_project_impact(edge, int(project_row["id"]))
+            if impact is None:
+                continue
+            for group in impact["groups"]:
+                split_component_ids.update(int(component["id"]) for component in group["components"])
+            affected_projects.append(impact)
+        affected_component_ids = self._edge_component_group(from_id) | self._edge_component_group(to_id)
+        dependent_ids = self._connected_edges({from_id, to_id})
+        if dependent_ids:
+            placeholders = ",".join("?" for _ in dependent_ids)
+            dependent_rows = self.conn.execute(
+                f"SELECT * FROM alias_edges WHERE status='pending' AND id IN ({placeholders}) ORDER BY id",
+                tuple(sorted(dependent_ids)),
+            ).fetchall()
+        else:
+            dependent_rows = []
+        return {
+            "edge": self.edge_dict(edge),
+            "generated_at": utc_now(),
+            "split_components": [
+                self._component_dict(component_id) for component_id in sorted(split_component_ids)
+            ],
+            "affected_projects": affected_projects,
+            "dependent_candidates": [self.edge_dict(row) for row in dependent_rows],
+            "connected_component_ids": sorted(affected_component_ids),
+        }
+
+    def create_revocation_preview(
+        self, edge_id: int, *, created_by: str = "operator"
+    ) -> dict[str, Any]:
+        impact = self.revocation_impact(edge_id)
+        existing = self.conn.execute(
+            "SELECT id FROM revocation_previews WHERE edge_id=? AND status='open' ORDER BY id",
+            (edge_id,),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(
+                f"open revocation preview #{int(existing['id'])} already exists for edge #{edge_id}"
+            )
+        now = utc_now()
+        preview_doc = dict(impact)
+        preview_doc["status"] = "open"
+        preview_doc["created_by"] = created_by
+        preview_doc["created_at"] = now
+        preview_doc["confirmed_by"] = None
+        preview_doc["confirmed_at"] = None
+        with self._transaction():
+            cursor = self.conn.execute(
+                "INSERT INTO revocation_previews(edge_id, status, created_by, created_at, preview_json) "
+                "VALUES(?, 'open', ?, ?, ?) RETURNING id",
+                (edge_id, created_by, now, json.dumps(preview_doc, ensure_ascii=False, sort_keys=True)),
+            )
+            preview_id = int(cursor.fetchone()[0])
+        return self.revocation_preview(preview_id)
+
+    def _preview_row(self, preview_id: int) -> sqlite3.Row:
+        row = self.conn.execute(
+            "SELECT * FROM revocation_previews WHERE id=?", (preview_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"revocation preview not found: #{preview_id}")
+        return row
+
+    def revocation_preview(self, preview_id: int) -> dict[str, Any]:
+        """Return the frozen preview snapshot; later rule changes never rewrite it."""
+        row = self._preview_row(preview_id)
+        doc = json.loads(row["preview_json"])
+        doc["preview_id"] = int(row["id"])
+        doc["edge_id"] = int(row["edge_id"])
+        doc["status"] = row["status"]
+        doc["created_by"] = row["created_by"]
+        doc["created_at"] = row["created_at"]
+        doc["cancelled_by"] = row["cancelled_by"]
+        doc["cancelled_at"] = row["cancelled_at"]
+        doc["confirmed_by"] = row["confirmed_by"]
+        doc["confirmed_at"] = row["confirmed_at"]
+        return doc
+
+    def list_revocation_previews(
+        self, *, edge_id: int | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT id FROM revocation_previews"
+        clauses = []
+        params: list[Any] = []
+        if edge_id is not None:
+            clauses.append("edge_id=?")
+            params.append(edge_id)
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self.revocation_preview(int(row["id"])) for row in rows]
+
+    def cancel_revocation_preview(
+        self, preview_id: int, *, cancelled_by: str = "operator"
+    ) -> dict[str, Any]:
+        row = self._preview_row(preview_id)
+        if row["status"] != "open":
+            raise ValueError(f"preview #{preview_id} is {row['status']}, not open")
+        now = utc_now()
+        with self._transaction():
+            self.conn.execute(
+                "UPDATE revocation_previews SET status='cancelled', cancelled_by=?, cancelled_at=? WHERE id=?",
+                (cancelled_by, now, preview_id),
+            )
+        return self.revocation_preview(preview_id)
+
+    def confirm_revocation_preview(
+        self, preview_id: int, *, confirmed_by: str | None = None
+    ) -> dict[str, Any]:
+        row = self._preview_row(preview_id)
+        if row["status"] != "open":
+            raise ValueError(f"preview #{preview_id} is {row['status']}, not open")
+        edge_id = int(row["edge_id"])
+        operator = confirmed_by or row["created_by"]
+        now = utc_now()
+        edge = self._edge_row(edge_id)
+        if edge["status"] != "approved":
+            raise ValueError(f"edge #{edge_id} is {edge['status']}, not approved")
+        from_id, to_id = int(edge["from_component_id"]), int(edge["to_component_id"])
+        affected_components = self._edge_component_group(from_id) | self._edge_component_group(to_id)
+        with self._transaction():
+            self.conn.execute(
+                "UPDATE alias_edges SET status='revoked', decided_at=?, decided_by=? WHERE id=?",
+                (now, operator, edge_id),
+            )
+            self.conn.execute(
+                "UPDATE revocation_previews SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+                (operator, now, preview_id),
+            )
+            refreshed = self._refresh_component_projects(
+                self.conn.cursor(), affected_components, reason="alias-revoke"
+            )
+        recheck = self._recheck_pending_after_revoke({from_id, to_id})
+        result = {
+            "preview": self.revocation_preview(preview_id),
+            "revoked_edge": edge_id,
+            "refreshed_projects": refreshed,
+            "affected_pending": recheck["affected_pending"],
+            "remaining_preview": recheck["remaining_preview"],
+        }
+        return result
+
+    def export_revocation_preview(
+        self, preview_id: int, *, exported_by: str = "operator"
+    ) -> dict[str, Any]:
+        """Return an exportable copy of the frozen preview with audit metadata."""
+        preview = self.revocation_preview(preview_id)
+        return {
+            "document": "alias-revocation-impact-preview",
+            "exported_by": exported_by,
+            "exported_at": utc_now(),
+            "preview": preview,
+        }
 
     def _recheck_pending_after_revoke(self, revoked_component_ids: set[int]) -> dict[str, Any]:
         pending = self.pending_edges()

@@ -145,6 +145,43 @@ def _print_revoke_result(result: dict, as_json: bool) -> None:
         _print_joint_preview(result["remaining_preview"])
 
 
+def _print_revocation_preview(preview: dict) -> None:
+    edge = preview["edge"]
+    print(
+        f"revocation preview #{preview['preview_id']} [{preview['status']}] "
+        f"for edge #{edge['id']}: {edge['from_purl']} <-> {edge['to_purl']}"
+    )
+    print(f"  created by {preview['created_by']} at {preview['created_at']}")
+    if preview.get("confirmed_at"):
+        print(f"  confirmed by {preview['confirmed_by']} at {preview['confirmed_at']}")
+    if preview.get("cancelled_at"):
+        print(f"  cancelled by {preview['cancelled_by']} at {preview['cancelled_at']}")
+    if preview["split_components"]:
+        print("  components that split apart:")
+        for component in preview["split_components"]:
+            print(f"    - {component['purl']} ({component['display_name']})")
+    else:
+        print("  no merged component would be split apart")
+    if not preview["affected_projects"]:
+        print("  no affected projects")
+    for project in preview["affected_projects"]:
+        print(
+            f"  affected project {project['project']} {project['project_version']} "
+            f"(edge range {project['edge_version_range']}) splits into:"
+        )
+        for group in project["groups"]:
+            versions = ", ".join(group["versions"]) or "(no versions)"
+            print(f"    * {group['purl']} versions={versions}")
+            for evidence in group["evidence"]:
+                print(
+                    f"        evidence {evidence['version']} {evidence['source_path']} :: {evidence['location_path']}"
+                )
+    if preview["dependent_candidates"]:
+        print("  pending candidates depending on this rule:")
+        for candidate in preview["dependent_candidates"]:
+            _print_edge(candidate)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Offline dependency evidence aggregation")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -183,6 +220,42 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
     list_parser.add_argument("--status", choices=("pending", "approved", "revoked", "rejected", "all"), default="all")
     list_parser.add_argument("--json", action="store_true")
+
+    revoke_preview_parser = alias_subparsers.add_parser(
+        "revoke-preview", help="create an impact preview before revoking an approved alias"
+    )
+    revoke_preview_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    revoke_preview_parser.add_argument("--edge-id", type=int, required=True)
+    revoke_preview_parser.add_argument("--by", default="operator")
+    revoke_preview_parser.add_argument("--json", action="store_true")
+    cancel_preview_parser = alias_subparsers.add_parser(
+        "revoke-cancel", help="cancel an open revocation impact preview"
+    )
+    cancel_preview_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    cancel_preview_parser.add_argument("--preview-id", type=int, required=True)
+    cancel_preview_parser.add_argument("--by", default="operator")
+    cancel_preview_parser.add_argument("--json", action="store_true")
+    confirm_preview_parser = alias_subparsers.add_parser(
+        "revoke-confirm", help="confirm a revocation preview and actually revoke the alias"
+    )
+    confirm_preview_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    confirm_preview_parser.add_argument("--preview-id", type=int, required=True)
+    confirm_preview_parser.add_argument("--by", help="operator performing the confirmation; defaults to the preview creator")
+    confirm_preview_parser.add_argument("--json", action="store_true")
+    export_preview_parser = alias_subparsers.add_parser(
+        "revoke-export", help="export a revocation impact preview snapshot"
+    )
+    export_preview_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    export_preview_parser.add_argument("--preview-id", type=int, required=True)
+    export_preview_parser.add_argument("--by", default="operator")
+    export_preview_parser.add_argument("--output", type=Path, help="write the exported JSON document here")
+    preview_list_parser = alias_subparsers.add_parser(
+        "revoke-previews", help="list revocation impact previews"
+    )
+    preview_list_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
+    preview_list_parser.add_argument("--edge-id", type=int)
+    preview_list_parser.add_argument("--status", choices=("open", "cancelled", "confirmed", "all"), default="all")
+    preview_list_parser.add_argument("--json", action="store_true")
 
     history_parser = subparsers.add_parser("history", help="list stored scan conclusion snapshots")
     history_parser.add_argument("--db", type=Path, default=Path("sca.sqlite3"))
@@ -237,6 +310,53 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(edge, ensure_ascii=False, indent=2))
                 else:
                     _print_edge(edge)
+            elif args.alias_command == "revoke-preview":
+                preview = store.create_revocation_preview(args.edge_id, created_by=args.by)
+                if args.json:
+                    print(json.dumps(preview, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_revocation_preview(preview)
+            elif args.alias_command == "revoke-cancel":
+                preview = store.cancel_revocation_preview(args.preview_id, cancelled_by=args.by)
+                if args.json:
+                    print(json.dumps(preview, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_revocation_preview(preview)
+            elif args.alias_command == "revoke-confirm":
+                result = store.confirm_revocation_preview(
+                    args.preview_id, confirmed_by=args.by
+                )
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                else:
+                    _print_revocation_preview(result["preview"])
+                    _print_revoke_result(
+                        {
+                            "revoked_edge": result["revoked_edge"],
+                            "refreshed_projects": result["refreshed_projects"],
+                            "affected_pending": result["affected_pending"],
+                            "remaining_preview": result["remaining_preview"],
+                        },
+                        False,
+                    )
+            elif args.alias_command == "revoke-export":
+                document = store.export_revocation_preview(args.preview_id, exported_by=args.by)
+                rendered = json.dumps(document, ensure_ascii=False, indent=2, default=str)
+                if args.output is not None:
+                    args.output.write_text(rendered + "\n", encoding="utf-8")
+                    print(f"exported preview #{args.preview_id} to {args.output}")
+                else:
+                    print(rendered)
+            elif args.alias_command == "revoke-previews":
+                previews = store.list_revocation_previews(
+                    edge_id=args.edge_id,
+                    status=None if args.status == "all" else args.status,
+                )
+                if args.json:
+                    print(json.dumps(previews, ensure_ascii=False, indent=2, default=str))
+                else:
+                    for preview in previews:
+                        _print_revocation_preview(preview)
             else:
                 edge_ids = _parse_edge_ids(args.edges)
                 sources = args.source or None
